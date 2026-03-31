@@ -1,7 +1,9 @@
+import { getUserSettings } from "./storage";
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 const normalizeFlag = (value: unknown) => String(value || "").trim().toLowerCase();
 
-type AnalyzeMode = "explain" | "calculate";
+type AnalyzeMode = "explain" | "calculate" | "simplify-question";
 
 interface AnalyzeOptions {
   assignmentId?: string;
@@ -50,6 +52,7 @@ export const debugEchoImage = async (blob: Blob, label: string) => {
 
 export async function analyzeDrawing(blob: Blob, options: AnalyzeOptions = {}) {
   const { assignmentId, problemIndex, mode, hintLevel, previousHints } = options;
+  const { appLanguage } = getUserSettings();
 
   if (isDebugImagesEnabled()) {
     const label = `gpt-analyze-${String(mode || "hint").toLowerCase()}-drawing`;
@@ -73,6 +76,9 @@ export async function analyzeDrawing(blob: Blob, options: AnalyzeOptions = {}) {
   if (Array.isArray(previousHints) && previousHints.length > 0) {
     formData.append("previousHints", JSON.stringify(previousHints));
   }
+  if (appLanguage) {
+    formData.append("appLanguage", appLanguage);
+  }
 
   const endpoint = import.meta.env.VITE_AI_ANALYZE_URL || `${API_BASE}/ai/analyze`;
   const response = await fetch(endpoint, {
@@ -87,4 +93,11 @@ export async function analyzeDrawing(blob: Blob, options: AnalyzeOptions = {}) {
   }
 
   return response.json();
+}
+
+export async function simplifyQuestion(blob: Blob, options: AnalyzeOptions = {}) {
+  return analyzeDrawing(blob, {
+    ...options,
+    mode: "simplify-question",
+  });
 }

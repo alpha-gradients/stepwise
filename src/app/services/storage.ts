@@ -17,6 +17,16 @@ interface User {
 
 export interface UserSettings {
   classLevel: number | null;
+  textToSpeechEnabled: boolean;
+  speechRate: number;
+  appLanguage: string;
+  dyslexiaFriendlyFont: boolean;
+  highContrastMode: boolean;
+  largeUiMode: boolean;
+  reduceMotion: boolean;
+  focusHighlight: boolean;
+  fontScale: number;
+  colorTheme: "default" | "dark";
 }
 
 interface Subject {
@@ -39,6 +49,16 @@ interface Assignment {
 interface AssignmentProblem {
   problemIndex: number;
   title: string;
+}
+
+interface AssignmentProblemDetection {
+  label: string;
+  bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 interface ProblemProgressRecord {
@@ -102,6 +122,7 @@ interface FileRecord {
   fileName: string;
   size: number;
   uploadedAt: number;
+  channel?: string;
 }
 
 interface Note {
@@ -226,19 +247,44 @@ const mapEasyAuthUser = (payload: unknown): User | null => {
   const claims = Array.isArray(principal.claims) ? principal.claims : [];
   const readClaim = (...types: string[]) =>
     claims.find((claim: AnyRecord) => types.includes(String(claim.typ)))?.val || "";
+  const looksLikeEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+  const getEmailLocalPart = (value: string) =>
+    (value.trim().split("@")[0] || "").replace(/[._-]+/g, " ").trim();
+  const resolveDisplayName = (email: string) => {
+    const givenName = String(
+      readClaim(
+        "given_name",
+        "givenname",
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname",
+      ) || "",
+    ).trim();
+    if (givenName) return givenName;
+
+    const fullName = String(
+      readClaim("name", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name") || "",
+    ).trim();
+    if (fullName && !looksLikeEmail(fullName)) return fullName;
+
+    const userDetails = String(principal.userDetails || "").trim();
+    if (userDetails && !looksLikeEmail(userDetails)) return userDetails;
+
+    const fallbackFromEmail = getEmailLocalPart(email);
+    if (fallbackFromEmail) return fallbackFromEmail;
+    return "User";
+  };
+
+  const email = String(
+    readClaim(
+      "email",
+      "emails",
+      "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+    ) || "",
+  );
 
   return {
     id: principal.userId,
-    name:
-      readClaim("name", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name") ||
-      principal.userDetails ||
-      "User",
-    email:
-      readClaim(
-        "email",
-        "emails",
-        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
-      ) || "",
+    name: resolveDisplayName(email),
+    email,
     provider: principal.identityProvider || "",
     avatarUrl:
       readClaim(
@@ -267,6 +313,48 @@ const parseClassLevel = (value: unknown): number | null => {
   return null;
 };
 
+const parseBoolean = (value: unknown, fallback = false) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off"].includes(normalized)) return false;
+  }
+  return fallback;
+};
+
+const clampNumber = (value: unknown, minimum: number, maximum: number, fallback: number) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(maximum, Math.max(minimum, numeric));
+};
+
+const parseColorTheme = (value: unknown): UserSettings["colorTheme"] => {
+  if (value === "default" || value === "dark") {
+    return value;
+  }
+  return "default";
+};
+
+const parseAppLanguage = (value: unknown) => {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized || "en";
+};
+
+export const DEFAULT_USER_SETTINGS: UserSettings = {
+  classLevel: null,
+  textToSpeechEnabled: false,
+  speechRate: 50,
+  appLanguage: "en",
+  dyslexiaFriendlyFont: false,
+  highContrastMode: false,
+  largeUiMode: false,
+  reduceMotion: false,
+  focusHighlight: true,
+  fontScale: 50,
+  colorTheme: "default",
+};
+
 const getUserSettingsStorageKey = (userId?: string) =>
   `${USER_SETTINGS_KEY_PREFIX}:${String(userId || cachedUser?.id || "anonymous")}`;
 
@@ -275,6 +363,19 @@ export const getUserSettings = (userId?: string): UserSettings => {
   const stored = readJson<Partial<UserSettings>>(key, {});
   return {
     classLevel: parseClassLevel(stored.classLevel),
+    textToSpeechEnabled: parseBoolean(stored.textToSpeechEnabled, DEFAULT_USER_SETTINGS.textToSpeechEnabled),
+    speechRate: clampNumber(stored.speechRate, 0, 100, DEFAULT_USER_SETTINGS.speechRate),
+    appLanguage: parseAppLanguage(stored.appLanguage),
+    dyslexiaFriendlyFont: parseBoolean(
+      stored.dyslexiaFriendlyFont,
+      DEFAULT_USER_SETTINGS.dyslexiaFriendlyFont,
+    ),
+    highContrastMode: parseBoolean(stored.highContrastMode, DEFAULT_USER_SETTINGS.highContrastMode),
+    largeUiMode: parseBoolean(stored.largeUiMode, DEFAULT_USER_SETTINGS.largeUiMode),
+    reduceMotion: parseBoolean(stored.reduceMotion, DEFAULT_USER_SETTINGS.reduceMotion),
+    focusHighlight: parseBoolean(stored.focusHighlight, DEFAULT_USER_SETTINGS.focusHighlight),
+    fontScale: clampNumber(stored.fontScale, 0, 100, DEFAULT_USER_SETTINGS.fontScale),
+    colorTheme: parseColorTheme(stored.colorTheme),
   };
 };
 
@@ -286,9 +387,52 @@ export const updateUserSettings = (
   const next: UserSettings = {
     classLevel:
       updates.classLevel === undefined ? current.classLevel : parseClassLevel(updates.classLevel),
+    textToSpeechEnabled:
+      updates.textToSpeechEnabled === undefined
+        ? current.textToSpeechEnabled
+        : parseBoolean(updates.textToSpeechEnabled, DEFAULT_USER_SETTINGS.textToSpeechEnabled),
+    speechRate:
+      updates.speechRate === undefined
+        ? current.speechRate
+        : clampNumber(updates.speechRate, 0, 100, DEFAULT_USER_SETTINGS.speechRate),
+    appLanguage:
+      updates.appLanguage === undefined
+        ? current.appLanguage
+        : parseAppLanguage(updates.appLanguage),
+    dyslexiaFriendlyFont:
+      updates.dyslexiaFriendlyFont === undefined
+        ? current.dyslexiaFriendlyFont
+        : parseBoolean(updates.dyslexiaFriendlyFont, DEFAULT_USER_SETTINGS.dyslexiaFriendlyFont),
+    highContrastMode:
+      updates.highContrastMode === undefined
+        ? current.highContrastMode
+        : parseBoolean(updates.highContrastMode, DEFAULT_USER_SETTINGS.highContrastMode),
+    largeUiMode:
+      updates.largeUiMode === undefined
+        ? current.largeUiMode
+        : parseBoolean(updates.largeUiMode, DEFAULT_USER_SETTINGS.largeUiMode),
+    reduceMotion:
+      updates.reduceMotion === undefined
+        ? current.reduceMotion
+        : parseBoolean(updates.reduceMotion, DEFAULT_USER_SETTINGS.reduceMotion),
+    focusHighlight:
+      updates.focusHighlight === undefined
+        ? current.focusHighlight
+        : parseBoolean(updates.focusHighlight, DEFAULT_USER_SETTINGS.focusHighlight),
+    fontScale:
+      updates.fontScale === undefined
+        ? current.fontScale
+        : clampNumber(updates.fontScale, 0, 100, DEFAULT_USER_SETTINGS.fontScale),
+    colorTheme:
+      updates.colorTheme === undefined ? current.colorTheme : parseColorTheme(updates.colorTheme),
   };
   writeJson(getUserSettingsStorageKey(userId), next);
   return next;
+};
+
+export const resetUserSettings = (userId?: string): UserSettings => {
+  writeJson(getUserSettingsStorageKey(userId), DEFAULT_USER_SETTINGS);
+  return DEFAULT_USER_SETTINGS;
 };
 
 export const getCurrentUser = async (): Promise<User | null> => {
@@ -348,6 +492,14 @@ export const listSubjects = async (): Promise<Subject[]> => {
       saveSubjectsLocal(subjects);
       return subjects;
     }
+
+    const createdDefault = (await request("/notebooks/subjects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: DEFAULT_SUBJECT_NAME }),
+    })) as Subject;
+    saveSubjectsLocal([createdDefault]);
+    return [createdDefault];
   } catch {
     // Fall back to localStorage if server is unavailable
   }
@@ -768,6 +920,67 @@ export const deleteAssignmentPdf = async (assignmentId: string): Promise<void> =
   });
 };
 
+export const saveAssignmentCaptureImage = async (assignmentId: string, file: File): Promise<void> => {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  await request(`/assignments/${encodeURIComponent(assignmentId)}/capture`, {
+    method: "POST",
+    body: formData,
+  });
+};
+
+export const detectAssignmentProblemRegions = async (
+  assignmentId: string,
+  file: File,
+): Promise<AssignmentProblemDetection[]> => {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const result = (await request(`/assignments/${encodeURIComponent(assignmentId)}/problem-detections`, {
+    method: "POST",
+    body: formData,
+  })) as { problems?: AssignmentProblemDetection[] };
+
+  return Array.isArray(result?.problems) ? result.problems : [];
+};
+
+export const getAssignmentCaptureImage = async (assignmentId: string): Promise<FileRecord | null> => {
+  return (await request(`/assignments/${encodeURIComponent(assignmentId)}/capture`)) as FileRecord | null;
+};
+
+export const getAssignmentCaptureImageDownloadUrl = async (assignmentId: string): Promise<string> => {
+  try {
+    const data = (await request(
+      `/assignments/${encodeURIComponent(assignmentId)}/capture/download-url`,
+    )) as { url?: string };
+    if (typeof data?.url === "string" && data.url.length > 0) {
+      return data.url;
+    }
+  } catch (error) {
+    const typedError = error as Error & { status?: number };
+    if (typedError.status !== 404) throw error;
+  }
+  return toUrl(`/assignments/${encodeURIComponent(assignmentId)}/capture/download`);
+};
+
+export const downloadAssignmentCaptureImageBlob = async (assignmentId: string): Promise<Blob> => {
+  const response = await fetch(toUrl(`/assignments/${encodeURIComponent(assignmentId)}/capture/download`), {
+    credentials: "include",
+    headers: buildUserHeaders(),
+  });
+  if (!response.ok) {
+    throw await buildError(response);
+  }
+  return response.blob();
+};
+
+export const deleteAssignmentCaptureImage = async (assignmentId: string): Promise<void> => {
+  await request(`/assignments/${encodeURIComponent(assignmentId)}/capture`, {
+    method: "DELETE",
+  });
+};
+
 export const getProblemScene = async (assignmentId: string, problemIndex: number) =>
   request(`/assignments/${encodeURIComponent(assignmentId)}/problems/${problemIndex}/scene`);
 
@@ -901,10 +1114,21 @@ export const getNotebookQuizSessions = async (): Promise<NotebookQuizSessionReco
 
 export const getErrorSummary = async (
   groupBy: "topic" | "concept" | "errorType",
-): Promise<ErrorSummaryRecord[]> =>
-  ((await request(`/errors/summary?groupBy=${encodeURIComponent(groupBy)}`)) as {
+  options: { assignmentId?: string; limit?: number } = {},
+): Promise<ErrorSummaryRecord[]> => {
+  const params = new URLSearchParams();
+  params.set("groupBy", groupBy);
+  if (options.assignmentId) {
+    params.set("assignmentId", String(options.assignmentId));
+  }
+  if (Number.isFinite(options.limit)) {
+    params.set("limit", String(Math.max(1, Math.min(100, Number(options.limit)))));
+  }
+
+  return ((await request(`/errors/summary?${params.toString()}`)) as {
     items?: ErrorSummaryRecord[];
   })?.items || [];
+};
 
 export const getProblemErrors = async (
   assignmentId: string,

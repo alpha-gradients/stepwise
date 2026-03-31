@@ -6,6 +6,10 @@ interface TopbarProps {
   onSignOut: () => void;
   onDeleteAccount: () => void;
   onOpenSettings: () => void;
+  onStopAudio: () => void;
+  showAudioControl: boolean;
+  isAudioPlaying: boolean;
+  audioButtonLabel?: string;
   streakCount: number;
   notificationCount: number;
 }
@@ -15,6 +19,10 @@ export function Topbar({
   onSignOut,
   onDeleteAccount,
   onOpenSettings,
+  onStopAudio,
+  showAudioControl,
+  isAudioPlaying,
+  audioButtonLabel = 'Play Audio',
   streakCount,
   notificationCount,
 }: TopbarProps) {
@@ -57,33 +65,36 @@ export function Topbar({
   return (
     <div className="app-topbar">
       <div className="topbar-left">
-        <div className="main-page-logo" aria-label="StepWise">
-          M
+        <div className="main-page-logo" aria-label="StepWise" data-no-translate="true">
+          <img src="/logo.svg" alt="StepWise logo" className="main-page-logo-image" />
         </div>
       </div>
 
       <div className="topbar-actions">
+        {showAudioControl ? (
+          <button
+            type="button"
+            className={`topbar-audio-button ${isAudioPlaying ? 'is-playing' : ''}`}
+            onClick={onStopAudio}
+            title={isAudioPlaying ? "Stop audio narration" : `${audioButtonLabel.toLowerCase()} narration`}
+            aria-label={isAudioPlaying ? "Stop audio narration" : `${audioButtonLabel.toLowerCase()} narration`}
+          >
+            <span>{isAudioPlaying ? 'Stop Audio' : audioButtonLabel}</span>
+          </button>
+        ) : null}
+
         <div className="topbar-streak-pill" title="Learning streak">
           <Flame size={18} />
           <span>{streakCount}</span>
         </div>
 
         <button className="icon-button notification-button" title="AI Recommendations">
-          {/* Inline SVG so sizing/styling is deterministic */}
-          <svg
-            width="40"
-            height="40"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
+          <img
+            src="/notification-bell-svgrepo-com.svg"
+            alt=""
             aria-hidden="true"
-          >
-            <path d="M12 22a2 2 0 0 0 2-2H10a2 2 0 0 0 2 2Z" />
-            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 7h18s-3 0-3-7Z" />
-          </svg>
+            className="notification-icon"
+          />
           {notificationCount > 0 ? <span className="notification-badge">{notificationCount}</span> : null}
         </button>
         <div style={{ position: 'relative' }} ref={menuRef}>
@@ -91,6 +102,7 @@ export function Topbar({
             className={`account-button ${avatarSrc && !avatarFailed ? 'account-button-with-photo' : ''}`}
             onClick={() => setShowAccountMenu(!showAccountMenu)}
             title={user.name}
+            data-no-translate="true"
           >
             {avatarSrc && !avatarFailed ? (
               <img
@@ -107,9 +119,12 @@ export function Topbar({
 
           {showAccountMenu && (
             <div className="account-menu">
-              <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--line)', marginBottom: '8px' }}>
-                <div style={{ fontWeight: 600, fontSize: '14px' }}>{user.name}</div>
-                <div style={{ fontSize: '12px', color: 'var(--muted)', marginTop: '2px' }}>{user.email}</div>
+              <div
+                style={{ padding: '8px 12px', borderBottom: '1px solid var(--line)', marginBottom: '8px' }}
+                data-no-translate="true"
+              >
+                <div style={{ fontWeight: 600, fontSize: 'calc(14px * var(--app-text-zoom))' }}>{user.name}</div>
+                <div style={{ fontSize: 'calc(12px * var(--app-text-zoom))', color: 'var(--muted)', marginTop: '2px' }}>{user.email}</div>
               </div>
 
               <button onClick={handleOpenSettings}>

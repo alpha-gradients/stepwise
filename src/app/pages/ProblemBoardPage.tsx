@@ -1,13 +1,22 @@
 import katex from "katex";
 import "katex/dist/katex.min.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Play, Square } from "lucide-react";
 import { Excalidraw, MainMenu, exportToCanvas } from "@excalidraw/excalidraw";
-import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
-import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { GlobalWorkerOptions, getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import "@excalidraw/excalidraw/index.css";
-import { analyzeDrawing, isDebugImagesEnabled } from "../services/ai";
+import { analyzeDrawing, isDebugImagesEnabled, simplifyQuestion } from "../services/ai";
+import { QuestionSimplifier } from "../components/QuestionSimplifier";
 import {
+  speakWithAzure,
+  stopAccessibilitySpeech,
+  subscribeAccessibilitySpeechState,
+} from "../services/accessibility";
+import {
+  downloadAssignmentCaptureImageBlob,
   getAssignmentById,
+  getAssignmentCaptureImage,
   getProblemContext,
   getProblemImage,
   getProblemScene,
@@ -17,7 +26,9 @@ import {
   downloadProblemImageBlob,
   downloadAssignmentPdfBlob,
   deleteProblemImage,
+  getUserSettings,
 } from "../services/storage";
+import { translateAppText } from "../services/translation";
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -31,10 +42,29 @@ const PROBLEM_CROP_SCALE = 2;
 const MAX_HINT_ITEMS = 3;
 const MAX_ERROR_ITEMS = 3;
 const MAX_SELECTION_INSIGHT_ITEMS = 1;
+const SIDEBAR_COLLAPSED_BREAKPOINT = Number.MAX_SAFE_INTEGER;
+const WHITEBOARD_AUTOSAVE_DELAY_MS = 2000;
+
+type WhiteboardExcalidrawApi = {
+  refresh: () => void;
+  updateScene?: (sceneData: {
+    appState?: {
+      openMenu?: "canvas" | "shape" | null;
+      openPopup?: "canvasBackground" | "elementBackground" | "elementStroke" | "fontFamily" | null;
+    };
+  }) => void;
+  getAppState?: () => {
+    openMenu?: "canvas" | "shape" | null;
+    openSidebar?: { name: string } | null;
+  };
+};
 
 const getDefaultScene = () => ({
   elements: [],
-  appState: { viewBackgroundColor: "#f8fafc" },
+  appState: {
+    viewBackgroundColor: "#f8fafc",
+    defaultSidebarDockedPreference: false,
+  },
   files: {},
 });
 
@@ -81,13 +111,18 @@ const extractInsightEntries = (value: any, forcedKind: string | null = null): an
       value.message ||
       value.value ||
       value.description ||
+      value.whyWrong ||
+      value.reason ||
       "";
+    const summaryValue =
+      value.title || value.label || value.mistakeSummary || value.summary || value.error || "";
 
     if (textValue) {
       return [
         {
           content: String(textValue),
-          title: value.title || value.label || "",
+          title: summaryValue,
+          observedStep: String(value.observedStep || value.observed_step || value.step || "").trim(),
           kind: value.kind || value.type || value.category || forcedKind,
         },
       ];
@@ -130,6 +165,7 @@ const parseInsightsForProblem = (assignment: any, problemIndex: number) => {
       content: String(entry.content || "").trim(),
       kind: classifyInsightKind(entry),
       title: String(entry.title || "").trim(),
+      observedStep: String(entry.observedStep || entry.observed_step || "").trim(),
     }))
     .filter((entry) => entry.content.length > 0);
 
@@ -212,10 +248,28 @@ const deriveInsightsFromAiResult = (result: any, requestedMode: string) => {
 
   const toEntries = (items: any, kind: string) =>
     Array.isArray(items)
-      ? items
-          .map((item) => String(item || "").trim())
-          .filter(Boolean)
-          .map((content) => ({ kind, content }))
+      ? items.flatMap((item) => {
+          if (typeof item === "string") {
+            const content = String(item || "").trim();
+            return content ? [{ kind, content }] : [];
+          }
+
+          if (item && typeof item === "object") {
+            const title = String(
+              item.title || item.label || item.summary || item.mistakeSummary || item.error || "",
+            ).trim();
+            const content = String(
+              item.content || item.text || item.reason || item.whyWrong || item.summary || item.error || "",
+            ).trim();
+            const observedStep = String(
+              item.observedStep || item.observed_step || item.step || result?.analysis?.observed_step || "",
+            ).trim();
+
+            return content ? [{ kind, title, content, observedStep }] : [];
+          }
+
+          return [];
+        })
       : [];
 
   entries.push(...toEntries(result?.hints, "hint"));
@@ -267,6 +321,7 @@ const deriveInsightsFromAiResult = (result: any, requestedMode: string) => {
     kind: entry.kind,
     title: entry.title,
     content: entry.content,
+    observedStep: entry.observedStep,
   }));
 };
 
@@ -280,10 +335,11 @@ const getPersistedScene = (scene: any) => {
     typeof scene?.appState?.viewBackgroundColor === "string"
       ? scene.appState.viewBackgroundColor
       : "#f8fafc";
+  const defaultSidebarDockedPreference = false;
 
   return {
     elements: normalizedElements,
-    appState: { viewBackgroundColor },
+    appState: { viewBackgroundColor, defaultSidebarDockedPreference },
     files: normalizedFiles,
   };
 };
@@ -403,12 +459,21 @@ interface ProblemBoardPageProps {
   onBack: () => void;
 }
 
+type PickerSource = "pdf" | "capture";
+
 export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: ProblemBoardPageProps) {
+  const pickerPageStorageKey = useMemo(
+    () => `stepwise_problem_picker_page_v1:${assignmentId}:${problemIndex}`,
+    [assignmentId, problemIndex],
+  );
   const [assignment, setAssignment] = useState<any>(null);
   const [status, setStatus] = useState("Loading whiteboard...");
   const [, setHint] = useState("Start drawing to receive hints.");
   const [initialScene, setInitialScene] = useState(getDefaultScene());
   const latestSceneRef = useRef(getDefaultScene());
+  const latestSceneSnapshotRef = useRef(JSON.stringify(getDefaultScene()));
+  const excalidrawApiRef = useRef<WhiteboardExcalidrawApi | null>(null);
+  const excalidrawRefreshRafRef = useRef<number | null>(null);
   const persistedInsights = useMemo(
     () => parseInsightsForProblem(assignment, problemIndex),
     [assignment, problemIndex],
@@ -443,11 +508,13 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
   const [sceneRevision, setSceneRevision] = useState(0);
   const [problemImageMeta, setProblemImageMeta] = useState<any>(null);
   const [problemImageUrl, setProblemImageUrl] = useState("");
+  const [questionExplanationStatus, setQuestionExplanationStatus] = useState("");
   const [problemContextMeta, setProblemContextMeta] = useState<any>(null);
   const [answerKeyDraft, setAnswerKeyDraft] = useState("");
   const [isSavingAnswerKey, setIsSavingAnswerKey] = useState(false);
   const [isPickerOpen, setIsPickerOpen] = useState(false);
   const [pickerStatus, setPickerStatus] = useState("");
+  const [pickerSource, setPickerSource] = useState<PickerSource>("pdf");
   const [pdfPageCount, setPdfPageCount] = useState(0);
   const [selectedPage, setSelectedPage] = useState(1);
   const [pageImageUrl, setPageImageUrl] = useState("");
@@ -478,12 +545,39 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
   const boardSelectionStartRef = useRef<any>(null);
   const hintLevelRef = useRef(1);
   const previousHintsRef = useRef<string[]>([]);
+  const autosaveTimerRef = useRef<number | null>(null);
+  const lastSavedSceneRef = useRef<string>("");
+  const pendingAutosaveAfterCurrentRef = useRef(false);
+  const isAutosavingRef = useRef(false);
+  const [playingInsightId, setPlayingInsightId] = useState<string | null>(null);
+  const [isAutosaving, setIsAutosaving] = useState(false);
+
+  useEffect(() => subscribeAccessibilitySpeechState((active) => {
+    if (!active) {
+      setPlayingInsightId(null);
+    }
+  }), []);
+
+  useEffect(() => () => {
+    stopAccessibilitySpeech();
+  }, []);
 
   const clearProblemImageUrl = useCallback(() => {
     if (!problemImageUrlRef.current) return;
     URL.revokeObjectURL(problemImageUrlRef.current);
     problemImageUrlRef.current = "";
     setProblemImageUrl("");
+  }, []);
+
+  const replaceProblemImageUrl = useCallback((nextUrl: string, revokeOnClear = false) => {
+    if (problemImageUrlRef.current) {
+      URL.revokeObjectURL(problemImageUrlRef.current);
+      problemImageUrlRef.current = "";
+    }
+    if (revokeOnClear) {
+      problemImageUrlRef.current = nextUrl;
+    }
+    setProblemImageUrl(nextUrl);
   }, []);
 
   const clearPageImageUrl = useCallback(() => {
@@ -510,6 +604,73 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
     hintLevelRef.current = 1;
   }, []);
 
+  const handleToggleInsightAudio = useCallback(async (insight: { id: string; title?: string; content: string; observedStep?: string }) => {
+    if (playingInsightId === insight.id) {
+      stopAccessibilitySpeech();
+      setPlayingInsightId(null);
+      return;
+    }
+
+    const settings = getUserSettings();
+    const rawSpeechText = [
+      String(insight.title || "").trim(),
+      insight.observedStep ? `Observed step: ${String(insight.observedStep).trim()}` : "",
+      String(insight.content || "").trim(),
+    ]
+      .filter(Boolean)
+      .join(". ");
+
+    if (!rawSpeechText) {
+      return;
+    }
+
+    setPlayingInsightId(insight.id);
+    try {
+      const speechText = await translateAppText(rawSpeechText, settings.appLanguage);
+      await speakWithAzure(speechText, settings, {
+        sessionKey: `problem-insight:${assignmentId}:${problemIndex}:${insight.id}`,
+      });
+    } catch {
+      // The shared speech service already handles fallback and logging.
+    } finally {
+      setPlayingInsightId((current) => (current === insight.id ? null : current));
+    }
+  }, [assignmentId, playingInsightId, problemIndex]);
+
+  const persistScene = useCallback(async (source: "manual" | "autosave") => {
+    const serializedScene = JSON.stringify(latestSceneRef.current);
+    if (serializedScene === lastSavedSceneRef.current) {
+      return;
+    }
+
+    if (isAutosavingRef.current) {
+      pendingAutosaveAfterCurrentRef.current = true;
+      return;
+    }
+
+    isAutosavingRef.current = true;
+    setIsAutosaving(true);
+
+    try {
+      await saveProblemScene(assignmentId, problemIndex, latestSceneRef.current);
+      lastSavedSceneRef.current = serializedScene;
+      if (source === "manual") {
+        setStatus(`Saved at ${new Date().toLocaleTimeString()}.`);
+      }
+    } finally {
+      isAutosavingRef.current = false;
+      setIsAutosaving(false);
+
+      if (pendingAutosaveAfterCurrentRef.current) {
+        pendingAutosaveAfterCurrentRef.current = false;
+        const nextSerializedScene = JSON.stringify(latestSceneRef.current);
+        if (nextSerializedScene !== lastSavedSceneRef.current) {
+          void persistScene("autosave");
+        }
+      }
+    }
+  }, [assignmentId, problemIndex]);
+
   const loadProblemImage = useCallback(async () => {
     const metadata = await getProblemImage(assignmentId, problemIndex);
     if (!metadata) {
@@ -518,15 +679,17 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
       return;
     }
 
+    setProblemImageMeta(metadata);
+
+    if (metadata.downloadUrl) {
+      replaceProblemImageUrl(metadata.downloadUrl);
+      return;
+    }
+
     const blob = await downloadProblemImageBlob(assignmentId, problemIndex);
     const objectUrl = URL.createObjectURL(blob);
-    if (problemImageUrlRef.current) {
-      URL.revokeObjectURL(problemImageUrlRef.current);
-    }
-    problemImageUrlRef.current = objectUrl;
-    setProblemImageMeta(metadata);
-    setProblemImageUrl(objectUrl);
-  }, [assignmentId, clearProblemImageUrl, problemIndex]);
+    replaceProblemImageUrl(objectUrl, true);
+  }, [assignmentId, clearProblemImageUrl, problemIndex, replaceProblemImageUrl]);
 
   const loadProblemContext = useCallback(async () => {
     const context = await getProblemContext(assignmentId, problemIndex);
@@ -537,6 +700,7 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
   const closePicker = useCallback(() => {
     setIsPickerOpen(false);
     setPickerStatus("");
+    setPickerSource("pdf");
     setPdfPageCount(0);
     setSelectedPage(1);
     setSelectionRect(null);
@@ -599,6 +763,7 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
         setInitialScene(getDefaultScene());
         setSceneRevision((revision) => revision + 1);
         latestSceneRef.current = getDefaultScene();
+        latestSceneSnapshotRef.current = JSON.stringify(latestSceneRef.current);
         setHint("Start drawing to receive hints.");
         lastSnapshotRef.current = null;
         hintLevelRef.current = 1;
@@ -615,6 +780,8 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
       setInitialScene(scene);
       setSceneRevision((revision) => revision + 1);
       latestSceneRef.current = scene;
+      latestSceneSnapshotRef.current = JSON.stringify(scene);
+      lastSavedSceneRef.current = JSON.stringify(scene);
       setHint("Start drawing to receive hints.");
       lastSnapshotRef.current = null;
       hintLevelRef.current = 1;
@@ -718,19 +885,80 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
   );
 
   const handleChange = useCallback((elements: any, appState: any, files: any) => {
-    latestSceneRef.current = getPersistedScene({ elements, appState, files });
+    const isMenuOpen = Boolean(appState?.openMenu);
+    setIsStylePanelOpen((current) => (current === isMenuOpen ? current : isMenuOpen));
+
+    const nextScene = getPersistedScene({ elements, appState, files });
+    const nextSerializedScene = JSON.stringify(nextScene);
+    if (nextSerializedScene === latestSceneSnapshotRef.current) {
+      return;
+    }
+
+    latestSceneRef.current = nextScene;
+    latestSceneSnapshotRef.current = nextSerializedScene;
+
+    if (autosaveTimerRef.current) {
+      window.clearTimeout(autosaveTimerRef.current);
+    }
+    autosaveTimerRef.current = window.setTimeout(() => {
+      void persistScene("autosave");
+    }, WHITEBOARD_AUTOSAVE_DELAY_MS);
+
     if (analyzeTimerRef.current) {
       window.clearTimeout(analyzeTimerRef.current);
     }
     analyzeTimerRef.current = window.setTimeout(() => {
       void analyzeSceneForHint(elements, appState, files);
     }, 3000);
-  }, [analyzeSceneForHint]);
+  }, [analyzeSceneForHint, persistScene]);
+
+  const scheduleExcalidrawRefresh = useCallback(() => {
+    if (!excalidrawApiRef.current?.refresh) return;
+    if (excalidrawRefreshRafRef.current != null) {
+      cancelAnimationFrame(excalidrawRefreshRafRef.current);
+    }
+    excalidrawRefreshRafRef.current = requestAnimationFrame(() => {
+      excalidrawApiRef.current?.refresh();
+    });
+  }, []);
+
+  const handleStylePanelToggle = useCallback(() => {
+    setIsStylePanelOpen((current) => {
+      const next = !current;
+      const api = excalidrawApiRef.current;
+      if (api?.updateScene) {
+        api.updateScene({
+          appState: {
+            openMenu: next ? "shape" : null,
+            openPopup: null,
+          },
+        });
+      }
+      return next;
+    });
+  }, []);
+
+  // Excalidraw caches container bounds for pointer coordinate mapping.
+  // When AI UI updates cause a reflow, those cached bounds can get stale,
+  // leading to a visible cursor offset while drawing. Refreshing fixes it
+  // without remounting Excalidraw (so the user's drawing stays intact).
+  useEffect(() => {
+    scheduleExcalidrawRefresh();
+  }, [scheduleExcalidrawRefresh, hintInsights.length, wrongInsights.length, selectionMode, status]);
+
+  useEffect(() => {
+    const handleWindowResize = () => scheduleExcalidrawRefresh();
+    window.addEventListener("resize", handleWindowResize);
+    return () => window.removeEventListener("resize", handleWindowResize);
+  }, [scheduleExcalidrawRefresh]);
 
   useEffect(
     () => () => {
       if (analyzeTimerRef.current) {
         window.clearTimeout(analyzeTimerRef.current);
+      }
+      if (autosaveTimerRef.current) {
+        window.clearTimeout(autosaveTimerRef.current);
       }
 
       if (problemImageUrlRef.current) {
@@ -752,24 +980,54 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
   );
 
   const handleSave = async () => {
-    await saveProblemScene(assignmentId, problemIndex, latestSceneRef.current);
-    setStatus(`Saved at ${new Date().toLocaleTimeString()}.`);
+    if (autosaveTimerRef.current) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+    await persistScene("manual");
   };
 
   const handleOpenPicker = async () => {
     setIsPickerOpen(true);
-    setPickerStatus("Loading PDF...");
+    setPickerStatus("Loading assignment upload...");
     try {
       const pdfBlob = await downloadAssignmentPdfBlob(assignmentId);
       const bytes = await pdfBlob.arrayBuffer();
       const loadingTask = getDocument({ data: new Uint8Array(bytes) });
       const pdfDocument = await loadingTask.promise;
       pdfDocumentRef.current = pdfDocument;
+      setPickerSource("pdf");
       setPdfPageCount(pdfDocument.numPages);
-      setSelectedPage(1);
-      await renderSelectedPage(pdfDocument, 1);
+      const storedPage = Number(localStorage.getItem(pickerPageStorageKey) || 1);
+      const initialPage = clamp(storedPage || 1, 1, pdfDocument.numPages || 1);
+      setSelectedPage(initialPage);
+      await renderSelectedPage(pdfDocument, initialPage);
+      return;
     } catch {
-      setPickerStatus("Unable to open PDF. Upload a PDF first.");
+      // Fall through to capture mode.
+    }
+
+    try {
+      const capture = await getAssignmentCaptureImage(assignmentId);
+      if (!capture) {
+        setPickerStatus("Unable to open source. Upload a PDF or image/capture first.");
+        return;
+      }
+      const captureBlob = await downloadAssignmentCaptureImageBlob(assignmentId);
+      const objectUrl = URL.createObjectURL(captureBlob);
+      if (pageImageUrlRef.current) {
+        URL.revokeObjectURL(pageImageUrlRef.current);
+      }
+      pageImageUrlRef.current = objectUrl;
+      setPickerSource("capture");
+      setPdfPageCount(1);
+      setSelectedPage(1);
+      setPageImageUrl(objectUrl);
+      setSelectionRect(null);
+      setIsSelecting(false);
+      setPickerStatus("Capture image ready. Drag on the image to select a crop area.");
+    } catch {
+      setPickerStatus("Unable to open source. Upload a PDF or image/capture first.");
     }
   };
 
@@ -788,12 +1046,18 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
   };
 
   const handlePageChange = async (value: string) => {
+    if (pickerSource !== "pdf") return;
     const nextPage = clamp(Number(value) || 1, 1, pdfPageCount || 1);
     setSelectedPage(nextPage);
     if (pdfDocumentRef.current) {
       await renderSelectedPage(pdfDocumentRef.current, nextPage);
     }
   };
+
+  useEffect(() => {
+    if (!isPickerOpen || pickerSource !== "pdf") return;
+    localStorage.setItem(pickerPageStorageKey, String(selectedPage));
+  }, [isPickerOpen, pickerPageStorageKey, pickerSource, selectedPage]);
 
   const handleSaveProblemImage = async () => {
     if (!pageImageUrl || !selectionRect || !cropImageRef.current) {
@@ -1068,6 +1332,29 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
     setStatus("Removed problem image.");
   };
 
+  const handleSimplifyQuestion = useCallback(async () => {
+    if (!problemImageUrl) {
+      return "This question is asking you to look at the uploaded problem image first.";
+    }
+
+    setQuestionExplanationStatus("Reading question...");
+    try {
+      const blob = await downloadProblemImageBlob(assignmentId, problemIndex);
+      const result = await simplifyQuestion(blob, {
+        assignmentId,
+        problemIndex,
+      });
+      setQuestionExplanationStatus("");
+      return (
+        String(result?.explanation || "").trim() ||
+        "This question is asking you to identify what quantity or value the problem wants."
+      );
+    } catch {
+      setQuestionExplanationStatus("");
+      return "This question is asking you to identify the goal of the problem in simpler language.";
+    }
+  }, [assignmentId, problemImageUrl, problemIndex]);
+
   if (!assignment) {
     return (
       <div className="app-content">
@@ -1081,7 +1368,7 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
       <header className="topbar">
         <div>
           <p className="eyebrow">Whiteboard</p>
-          <h1>{assignment.title} - Problem {problemIndex}</h1>
+          <h1><span data-no-translate="true">{assignment.title}</span> - Problem {problemIndex}</h1>
         </div>
         <div className="topbar-actions">
           {!selectionMode && (
@@ -1101,8 +1388,8 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
               >
                 Explain
               </button>
-              <button type="button" onClick={handleSave} className="btn-primary">
-                Save Drawing
+              <button type="button" onClick={handleSave} className="btn-primary" disabled={isAutosaving}>
+                {isAutosaving ? "Saving..." : "Save Drawing"}
               </button>
               <button type="button" className="outline" onClick={onBack}>
                 Back
@@ -1111,7 +1398,7 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
           )}
           {selectionMode && (
             <>
-              <p className="subtle" style={{ fontSize: '0.85rem', maxWidth: '400px' }}>
+              <p className="subtle" style={{ fontSize: 'calc(0.85rem * var(--app-text-zoom))', maxWidth: '400px' }}>
                 For Calc/Explain, first choose the tool, then drag on the whiteboard to select a portion.
               </p>
               <button
@@ -1151,7 +1438,7 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
         <h2>Problem Image</h2>
         <div className="control-row">
           <button type="button" onClick={handleOpenPicker}>
-            Replace from PDF
+            Replace from Upload
           </button>
           {problemImageMeta && (
             <>
@@ -1172,6 +1459,8 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
           />
         )}
         {!problemImageUrl && <p className="subtle">No problem image set.</p>}
+        <QuestionSimplifier onOpen={handleSimplifyQuestion} />
+        {questionExplanationStatus ? <p className="subtle mt-1">{questionExplanationStatus}</p> : null}
       </section>
 
       <div className="whiteboard-stage">
@@ -1182,16 +1471,26 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
           <button
             type="button"
             className="style-panel-toggle"
-            onClick={() => setIsStylePanelOpen((prev) => !prev)}
+            onClick={handleStylePanelToggle}
+            aria-expanded={isStylePanelOpen}
           >
-            {isStylePanelOpen ? "Hide" : "Show"} Tools
+            Styles {isStylePanelOpen ? "v" : ">"}
           </button>
-
           <Excalidraw
             key={sceneRevision}
             initialData={initialScene}
             onChange={handleChange}
+            excalidrawAPI={(api) => {
+              excalidrawApiRef.current = {
+                refresh: api.refresh.bind(api),
+                updateScene: api.updateScene?.bind(api),
+                getAppState: api.getAppState?.bind(api),
+              };
+              setIsStylePanelOpen(Boolean(api.getAppState?.().openMenu));
+            }}
+            detectScroll={true}
             UIOptions={{
+              dockedSidebarBreakpoint: SIDEBAR_COLLAPSED_BREAKPOINT,
               canvasActions: {
                 saveAsImage: false,
               },
@@ -1248,15 +1547,55 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
             <h2>Recommendations</h2>
 
             {wrongInsights.length > 0 && (
-              <div className="insight-group">
-                <h3>Errors</h3>
-                {wrongInsights.map((insight) => (
-                  <details key={insight.id} className="insight-item insight-item-wrong" open>
-                    <summary>{insight.title || "Error Found"}</summary>
-                    <LatexText text={insight.content} as="p" />
-                  </details>
-                ))}
-              </div>
+              <details className="insight-group insight-group-errors">
+                <summary className="insight-group-summary">
+                  <span>Errors</span>
+                  <span className="insight-group-summary-meta">
+                    <span className="insight-group-count">{wrongInsights.length}</span>
+                    <span className="insight-summary-toggle" aria-hidden="true" />
+                  </span>
+                </summary>
+                <div className="insight-group-body">
+                  {wrongInsights.map((insight) => (
+                    <details key={insight.id} className="insight-item insight-item-wrong">
+                      <summary>
+                        <span className="insight-summary-title">{insight.title || "Error Found"}</span>
+                        <span className="insight-summary-controls">
+                          <button
+                            type="button"
+                            className={`btn-secondary btn-sm insight-audio-button ${
+                              playingInsightId === insight.id ? "is-playing" : ""
+                            }`}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              void handleToggleInsightAudio(insight);
+                            }}
+                            aria-label={playingInsightId === insight.id ? "Stop error audio" : "Play error audio"}
+                            title={playingInsightId === insight.id ? "Stop audio" : "Play audio"}
+                          >
+                            {playingInsightId === insight.id ? <Square size={13} /> : <Play size={14} />}
+                            {playingInsightId === insight.id ? "Stop" : "Play"}
+                          </button>
+                          <span className="insight-summary-toggle" aria-hidden="true" />
+                        </span>
+                      </summary>
+                      <div className="insight-item-body">
+                        {insight.observedStep && (
+                          <div className="insight-detail-block">
+                            <span className="insight-detail-label">Observed step</span>
+                            <LatexText text={insight.observedStep} as="p" />
+                          </div>
+                        )}
+                        <div className="insight-detail-block">
+                          <span className="insight-detail-label">Why AI flagged it</span>
+                          <LatexText text={insight.content} as="p" />
+                        </div>
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              </details>
             )}
 
             {hintInsights.length > 0 && (
@@ -1274,12 +1613,33 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
                     }`}
                   >
                     <summary>
-                      {insight.title ||
-                        (insight.kind === "calculate"
-                          ? "Calculated Result"
-                          : insight.kind === "explain"
-                            ? "Explained Selection"
-                            : "Hint")}
+                      <span className="insight-summary-title">
+                        {insight.title ||
+                          (insight.kind === "calculate"
+                            ? "Calculated Result"
+                            : insight.kind === "explain"
+                              ? "Explained Selection"
+                              : "Hint")}
+                      </span>
+                      <span className="insight-summary-controls">
+                        <button
+                          type="button"
+                          className={`btn-secondary btn-sm insight-audio-button ${
+                            playingInsightId === insight.id ? "is-playing" : ""
+                          }`}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void handleToggleInsightAudio(insight);
+                          }}
+                          aria-label={playingInsightId === insight.id ? "Stop insight audio" : "Play insight audio"}
+                          title={playingInsightId === insight.id ? "Stop audio" : "Play audio"}
+                        >
+                          {playingInsightId === insight.id ? <Square size={13} /> : <Play size={14} />}
+                          {playingInsightId === insight.id ? "Stop" : "Play"}
+                        </button>
+                        <span className="insight-summary-toggle" aria-hidden="true" />
+                      </span>
                     </summary>
                     <LatexText text={insight.content} as="p" />
                   </details>
@@ -1325,23 +1685,25 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
       {isPickerOpen && (
         <div className="modal-overlay" onClick={closePicker}>
           <div className="panel picker-panel" onClick={(e) => e.stopPropagation()}>
-            <h2>Select Problem from PDF</h2>
+            <h2>{pickerSource === "pdf" ? "Select Problem from PDF" : "Select Problem from Capture"}</h2>
             <p className="subtle">{pickerStatus}</p>
 
-            <div className="control-row">
-              <label className="picker-label">
-                Page:
-                <input
-                  type="number"
-                  min={1}
-                  max={pdfPageCount || 1}
-                  value={selectedPage}
-                  onChange={(e) => void handlePageChange(e.target.value)}
-                  disabled={isRenderingPage}
-                />
-              </label>
-              <span className="subtle">of {pdfPageCount}</span>
-            </div>
+            {pickerSource === "pdf" && (
+              <div className="control-row">
+                <label className="picker-label">
+                  Page:
+                  <input
+                    type="number"
+                    min={1}
+                    max={pdfPageCount || 1}
+                    value={selectedPage}
+                    onChange={(e) => void handlePageChange(e.target.value)}
+                    disabled={isRenderingPage}
+                  />
+                </label>
+                <span className="subtle">of {pdfPageCount}</span>
+              </div>
+            )}
 
             {pageImageUrl && (
               <div className="picker-crop-shell">
@@ -1356,7 +1718,7 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
                   <img
                     ref={cropImageRef}
                     src={pageImageUrl}
-                    alt={`Page ${selectedPage}`}
+                    alt={pickerSource === "pdf" ? `Page ${selectedPage}` : "Captured assignment"}
                     className="picker-crop-image"
                     draggable={false}
                     onDragStart={(event) => event.preventDefault()}

@@ -1,20 +1,33 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import pdfWorker from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
+import { extractImageText } from '../services/noteUploads';
 import {
   getAssignmentById,
   getSubjectById,
   addProblemToAssignment,
   deleteProblemFromAssignment,
   deleteAssignmentPdf,
+  deleteAssignmentCaptureImage,
+  getAssignmentCaptureImage,
+  getAssignmentCaptureImageDownloadUrl,
   getAssignmentPdf,
   getAssignmentPdfDownloadUrl,
   listAssignmentProblems,
   renameAssignmentProblem,
+  detectAssignmentProblemRegions,
   saveAssignmentPdf,
+  saveAssignmentCaptureImage,
+  saveProblemImage,
 } from '../services/storage';
 
 const MIN_PROBLEM_COUNT = 1;
 const MAX_PROBLEM_COUNT = 60;
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
+const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
+const CAPTURE_TYPES = ['image/png', 'image/jpeg'];
+
+GlobalWorkerOptions.workerSrc = pdfWorker;
 
 const normalizeProblemCount = (value: number) => {
   const parsed = Number(value);
@@ -24,6 +37,284 @@ const normalizeProblemCount = (value: number) => {
 
 const buildProblemIndexes = (problemCount: number) =>
   Array.from({ length: normalizeProblemCount(problemCount) }, (_value, index) => index + 1);
+
+interface WorksheetPage {
+  file: File;
+  pageText?: string;
+}
+
+const inferProblemCountFromText = (text: string) => {
+  const normalized = String(text || '');
+  if (!normalized.trim()) return 0;
+
+  const numberedMatches = Array.from(
+    normalized.matchAll(/(?:^|\n|\s)(\d{1,2})[\).\:-]\s+/g),
+  ).map((match) => Number(match[1]));
+
+  const uniqueNumbers = Array.from(new Set(numberedMatches.filter((value) => Number.isInteger(value) && value > 0)));
+  if (uniqueNumbers.length >= 2) {
+    return Math.min(MAX_PROBLEM_COUNT, uniqueNumbers.length);
+  }
+
+  const questionMatches = normalized.match(/\b(?:Question|Problem|Q)\s*\d{1,2}\b/gi) || [];
+  return Math.min(MAX_PROBLEM_COUNT, questionMatches.length);
+};
+
+const buildVerticalFallbackDetections = (count: number) => {
+  const safeCount = Math.max(1, Math.min(MAX_PROBLEM_COUNT, count));
+  return Array.from({ length: safeCount }, (_value, index) => {
+    const y = index / safeCount;
+    const nextY = (index + 1) / safeCount;
+    return {
+      label: `Problem ${index + 1}`,
+      bounds: {
+        x: 0.02,
+        y: Math.max(0, y - 0.01),
+        width: 0.96,
+        height: Math.min(1, nextY - y + 0.02),
+      },
+    };
+  });
+};
+
+const extractProblemNumber = (label: string) => {
+  const match = String(label || '').match(/\b(\d{1,2})\b/);
+  const value = Number(match?.[1]);
+  return Number.isInteger(value) && value > 0 ? value : null;
+};
+
+const calculateIntersectionArea = (
+  left: { x: number; y: number; width: number; height: number },
+  right: { x: number; y: number; width: number; height: number },
+) => {
+  const startX = Math.max(left.x, right.x);
+  const startY = Math.max(left.y, right.y);
+  const endX = Math.min(left.x + left.width, right.x + right.width);
+  const endY = Math.min(left.y + left.height, right.y + right.height);
+  const width = Math.max(0, endX - startX);
+  const height = Math.max(0, endY - startY);
+  return width * height;
+};
+
+const dedupeProblemDetections = (
+  detections: Array<{
+    label: string;
+    bounds: { x: number; y: number; width: number; height: number };
+  }>,
+) => {
+  if (detections.length <= 1) return detections;
+
+  const sorted = [...detections].sort((left, right) => {
+    const leftNumber = extractProblemNumber(left.label);
+    const rightNumber = extractProblemNumber(right.label);
+    if (leftNumber != null && rightNumber != null && leftNumber !== rightNumber) {
+      return leftNumber - rightNumber;
+    }
+    if (left.bounds.y !== right.bounds.y) {
+      return left.bounds.y - right.bounds.y;
+    }
+    return left.bounds.x - right.bounds.x;
+  });
+
+  const uniqueDetections: typeof detections = [];
+  for (const detection of sorted) {
+    const area = detection.bounds.width * detection.bounds.height;
+    const hasHeavyOverlap = uniqueDetections.some((existing) => {
+      const intersectionArea = calculateIntersectionArea(existing.bounds, detection.bounds);
+      const smallerArea = Math.max(0.0001, Math.min(
+        existing.bounds.width * existing.bounds.height,
+        area,
+      ));
+      return intersectionArea / smallerArea > 0.72;
+    });
+
+    if (!hasHeavyOverlap) {
+      uniqueDetections.push(detection);
+    }
+  }
+
+  return uniqueDetections;
+};
+
+const buildPaddedProblemDetections = (
+  detections: Array<{
+    label: string;
+    bounds: { x: number; y: number; width: number; height: number };
+  }>,
+) => {
+  const deduped = dedupeProblemDetections(detections);
+  return deduped.map((detection) => {
+    const horizontalPadding = Math.min(0.02, detection.bounds.width * 0.18);
+    const verticalPadding = Math.min(0.018, detection.bounds.height * 0.22);
+    const nextX = Math.max(0, detection.bounds.x - horizontalPadding);
+    const nextY = Math.max(0, detection.bounds.y - verticalPadding);
+    const right = Math.min(1, detection.bounds.x + detection.bounds.width + horizontalPadding);
+    const bottom = Math.min(1, detection.bounds.y + detection.bounds.height + verticalPadding);
+
+    return {
+      label: detection.label,
+      sortNumber: extractProblemNumber(detection.label),
+      bounds: {
+        x: nextX,
+        y: nextY,
+        width: Math.max(0.08, right - nextX),
+        height: Math.max(0.08, bottom - nextY),
+      },
+    };
+  }).sort((left, right) => {
+    if (left.sortNumber != null && right.sortNumber != null && left.sortNumber !== right.sortNumber) {
+      return left.sortNumber - right.sortNumber;
+    }
+    if (left.sortNumber != null && right.sortNumber == null) return -1;
+    if (left.sortNumber == null && right.sortNumber != null) return 1;
+    if (left.bounds.y !== right.bounds.y) {
+      return left.bounds.y - right.bounds.y;
+    }
+    return left.bounds.x - right.bounds.x;
+  }).map(({ sortNumber, ...detection }) => detection);
+};
+
+const cropProblemImage = async (
+  file: File,
+  bounds: { x: number; y: number; width: number; height: number },
+  problemIndex: number,
+) => {
+  const imageUrl = URL.createObjectURL(file);
+
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const nextImage = new Image();
+      nextImage.onload = () => resolve(nextImage);
+      nextImage.onerror = () => reject(new Error('Unable to read worksheet image.'));
+      nextImage.src = imageUrl;
+    });
+
+    const cropX = Math.max(0, Math.round(image.naturalWidth * bounds.x));
+    const cropY = Math.max(0, Math.round(image.naturalHeight * bounds.y));
+    const cropWidth = Math.max(1, Math.round(image.naturalWidth * bounds.width));
+    const cropHeight = Math.max(1, Math.round(image.naturalHeight * bounds.height));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = cropWidth;
+    canvas.height = cropHeight;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('Unable to create crop canvas.');
+    }
+
+    context.drawImage(
+      image,
+      cropX,
+      cropY,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      cropWidth,
+      cropHeight,
+    );
+
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) {
+      throw new Error('Unable to export cropped question.');
+    }
+
+    return new File([blob], `problem-${problemIndex}.png`, { type: 'image/png' });
+  } finally {
+    URL.revokeObjectURL(imageUrl);
+  }
+};
+
+const renderPdfToWorksheetPages = async (file: File): Promise<WorksheetPage[]> => {
+  const bytes = await file.arrayBuffer();
+  const loadingTask = getDocument({ data: new Uint8Array(bytes) });
+  const pdf = await loadingTask.promise;
+  const pages: WorksheetPage[] = [];
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const baseViewport = page.getViewport({ scale: 1 });
+    const scale = Math.min(2.4, 2200 / Math.max(baseViewport.width, 1));
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(viewport.width));
+    canvas.height = Math.max(1, Math.round(viewport.height));
+    const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('Unable to render PDF page.');
+    }
+
+    await page.render({ canvasContext: context, viewport }).promise;
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) {
+      throw new Error(`Unable to export PDF page ${pageNumber}.`);
+    }
+
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items
+      .map((item) => ('str' in item ? String(item.str || '') : ''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    pages.push({
+      file: new File([blob], `assignment-page-${pageNumber}.png`, { type: 'image/png' }),
+      pageText,
+    });
+  }
+
+  return pages;
+};
+
+const buildDetectedProblemCrops = async (
+  assignmentId: string,
+  worksheetPages: WorksheetPage[],
+) => {
+  const croppedProblems: Array<{ label: string; file: File }> = [];
+
+  for (const worksheetPage of worksheetPages) {
+    const imageFile = worksheetPage.file;
+    let detections: Array<{
+      label: string;
+      bounds: { x: number; y: number; width: number; height: number };
+    }> = [];
+
+    try {
+      detections = await detectAssignmentProblemRegions(assignmentId, imageFile);
+    } catch {
+      detections = [];
+    }
+
+    let effectiveDetections =
+      detections.length > 0
+        ? buildPaddedProblemDetections(detections)
+        : [{ label: 'Problem 1', bounds: { x: 0, y: 0, width: 1, height: 1 } }];
+
+    if (effectiveDetections.length <= 1) {
+      try {
+        const directPageText = String(worksheetPage.pageText || '').trim();
+        const extractedText = directPageText || await extractImageText(imageFile);
+        const inferredCount = inferProblemCountFromText(extractedText);
+        if (inferredCount > effectiveDetections.length) {
+          effectiveDetections = buildVerticalFallbackDetections(inferredCount);
+        }
+      } catch {
+        // Keep detector output when OCR fallback is unavailable.
+      }
+    }
+
+    for (const detection of effectiveDetections) {
+      const problemIndex = croppedProblems.length + 1;
+      const croppedFile = await cropProblemImage(imageFile, detection.bounds, problemIndex);
+      croppedProblems.push({
+        label: detection.label?.trim() || `Problem ${problemIndex}`,
+        file: croppedFile,
+      });
+    }
+  }
+
+  return croppedProblems;
+};
 
 interface AssignmentDetailPageProps {
   subjectId: string;
@@ -36,9 +327,12 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
   const [subject, setSubject] = useState<any>(null);
   const [assignment, setAssignment] = useState<any>(null);
   const [fileRecord, setFileRecord] = useState<any>(null);
+  const [captureRecord, setCaptureRecord] = useState<any>(null);
   const [problemTitles, setProblemTitles] = useState<Record<number, string>>({});
   const [status, setStatus] = useState('Loading assignment...');
   const [loading, setLoading] = useState(false);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
 
   const loadProblemTitles = useCallback(async () => {
     const problems = await listAssignmentProblems(assignmentId);
@@ -59,6 +353,8 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
       setAssignment(assignmentData);
       setSubject(subjectData || { id: subjectId, name: "Subject" });
       setFileRecord(fileData || null);
+      const captureData = await getAssignmentCaptureImage(assignmentId).catch(() => null);
+      setCaptureRecord(captureData || null);
       setStatus('Assignment loaded.');
 
       try {
@@ -76,6 +372,44 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
   useEffect(() => {
     void load();
   }, [load]);
+
+  const applyAutoGeneratedProblems = useCallback(async (problems: Array<{ label: string; file: File }>) => {
+    if (problems.length === 0) {
+      setStatus('No problems were detected automatically.');
+      return;
+    }
+
+    let workingAssignment = assignment;
+    while (normalizeProblemCount(workingAssignment?.problemCount || 1) < problems.length) {
+      workingAssignment = await addProblemToAssignment(assignmentId);
+    }
+    while (normalizeProblemCount(workingAssignment?.problemCount || 1) > problems.length) {
+      const result = await deleteProblemFromAssignment(
+        assignmentId,
+        normalizeProblemCount(workingAssignment.problemCount),
+      );
+      workingAssignment = result.assignment;
+    }
+
+    if (workingAssignment) {
+      setAssignment(workingAssignment);
+    }
+
+    for (const [index, problem] of problems.entries()) {
+      const problemIndex = index + 1;
+      await saveProblemImage(assignmentId, problemIndex, problem.file);
+      if (problem.label.trim()) {
+        await renameAssignmentProblem(assignmentId, problemIndex, problem.label.trim());
+      }
+    }
+
+    await loadProblemTitles();
+    const refreshedAssignment = await getAssignmentById(assignmentId).catch(() => null);
+    if (refreshedAssignment) {
+      setAssignment(refreshedAssignment);
+    }
+    setStatus(`Created ${problems.length} whiteboard${problems.length === 1 ? '' : 's'} automatically from the assignment sheet.`);
+  }, [assignment, assignmentId, loadProblemTitles]);
 
   const handleAddProblem = async () => {
     if (!assignment) return;
@@ -159,9 +493,12 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
     setLoading(true);
     try {
       await saveAssignmentPdf(assignmentId, file);
-      setStatus(`Uploaded ${file.name}.`);
+      setStatus(`Uploaded ${file.name}. Detecting questions and creating whiteboards...`);
       const nextRecord = await getAssignmentPdf(assignmentId);
       setFileRecord(nextRecord || null);
+      const worksheetPages = await renderPdfToWorksheetPages(file);
+      const problems = await buildDetectedProblemCrops(assignmentId, worksheetPages);
+      await applyAutoGeneratedProblems(problems);
     } catch (error) {
       setStatus((error as Error)?.message || 'Unable to upload PDF.');
     } finally {
@@ -175,6 +512,58 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
       window.open(url, '_blank', 'noopener,noreferrer');
     } catch (error) {
       setStatus((error as Error)?.message || 'Unable to open PDF.');
+    }
+  };
+
+  const handleCaptureUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    if (!CAPTURE_TYPES.includes(file.type)) {
+      setStatus('Please upload JPG or PNG image.');
+      return;
+    }
+
+    if (file.size > MAX_CAPTURE_BYTES) {
+      setStatus('Image exceeds the 8MB upload limit.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await saveAssignmentCaptureImage(assignmentId, file);
+      setStatus(`Uploaded ${file.name}. Detecting questions and creating whiteboards...`);
+      const nextRecord = await getAssignmentCaptureImage(assignmentId);
+      setCaptureRecord(nextRecord || null);
+      const problems = await buildDetectedProblemCrops(assignmentId, [{ file }]);
+      await applyAutoGeneratedProblems(problems);
+    } catch (error) {
+      setStatus((error as Error)?.message || 'Unable to auto-create whiteboards from this capture.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleOpenCapture = async () => {
+    try {
+      const url = await getAssignmentCaptureImageDownloadUrl(assignmentId);
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (error) {
+      setStatus((error as Error)?.message || 'Unable to open capture image.');
+    }
+  };
+
+  const handleRemoveCapture = async () => {
+    setLoading(true);
+    try {
+      await deleteAssignmentCaptureImage(assignmentId);
+      setCaptureRecord(null);
+      setStatus('Removed image/capture upload.');
+    } catch (error) {
+      setStatus((error as Error)?.message || 'Unable to remove capture image.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -212,10 +601,10 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
           <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M15 10H5M5 10l4 4M5 10l4-4" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
-          Back to {subject.name}
+          Back to <span data-no-translate="true">{subject.name}</span>
         </button>
-        <h1>📝 {assignment.title}</h1>
-        <p>{subject.name} • {normalizeProblemCount(assignment.problemCount)} problems</p>
+        <h1>📝 <span data-no-translate="true">{assignment.title}</span></h1>
+        <p><span data-no-translate="true">{subject.name}</span> • {normalizeProblemCount(assignment.problemCount)} problems</p>
       </div>
 
       <div className="form-section mb-3">
@@ -246,6 +635,60 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
           <p className="text-muted text-sm">No PDF uploaded yet.</p>
         )}
         <p className="form-help">{status}</p>
+        <hr style={{ margin: '12px 0 10px' }} />
+        <h3 className="page-subsection-title">Image/Capture Channel</h3>
+        <div className="form-row">
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => cameraInputRef.current?.click()}
+            disabled={loading}
+          >
+            Open Camera
+          </button>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => galleryInputRef.current?.click()}
+            disabled={loading}
+          >
+            Upload JPG/PNG
+          </button>
+          <input
+            ref={cameraInputRef}
+            type="file"
+            accept="image/png,image/jpeg"
+            capture="environment"
+            onChange={handleCaptureUpload}
+            disabled={loading}
+            style={{ display: 'none' }}
+          />
+          <input
+            ref={galleryInputRef}
+            type="file"
+            accept="image/png,image/jpeg"
+            onChange={handleCaptureUpload}
+            disabled={loading}
+            style={{ display: 'none' }}
+          />
+          {captureRecord && (
+            <>
+              <button type="button" className="btn-secondary" onClick={handleOpenCapture} disabled={loading}>
+                Open Capture
+              </button>
+              <button type="button" className="btn-danger" onClick={handleRemoveCapture} disabled={loading}>
+                Remove Capture
+              </button>
+            </>
+          )}
+        </div>
+        {captureRecord ? (
+          <p className="text-muted text-sm">
+            {captureRecord.fileName} ({Math.round(captureRecord.size / 1024)} KB)
+          </p>
+        ) : (
+          <p className="text-muted text-sm">No image/capture uploaded yet.</p>
+        )}
       </div>
 
       <div className="form-section mb-3">
@@ -269,7 +712,7 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
       </div>
 
       <div>
-        <h2 className="mb-2" style={{ fontSize: '20px', fontWeight: 600 }}>
+        <h2 className="page-section-title mb-2">
           🎯 Problems
         </h2>
         <div className="cards-grid">
@@ -280,7 +723,7 @@ export function AssignmentDetailPage({ subjectId, assignmentId, onBack, onOpenPr
               onClick={() => onOpenProblem(problemIndex)}
               style={{ cursor: 'pointer' }}
             >
-              <h2 style={{ fontSize: '18px' }}>{getProblemTitle(problemIndex)}</h2>
+              <h2>{getProblemTitle(problemIndex)}</h2>
               <p className="text-muted text-sm">Click to open whiteboard</p>
               <div className="card-actions">
                 <button

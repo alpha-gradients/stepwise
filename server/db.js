@@ -127,6 +127,19 @@ export const initDb = async () => {
     `);
 
     await activePool.query(`
+      CREATE TABLE IF NOT EXISTS assignment_capture_images (
+        assignment_id TEXT PRIMARY KEY REFERENCES assignments(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        blob_name TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        size BIGINT NOT NULL,
+        uploaded_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+      );
+    `);
+
+    await activePool.query(`
       CREATE TABLE IF NOT EXISTS problem_images (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -206,6 +219,25 @@ export const initDb = async () => {
     await activePool.query(`
       CREATE INDEX IF NOT EXISTS idx_notebook_quiz_sessions_user
       ON notebook_quiz_sessions (user_id, updated_at DESC);
+    `);
+
+    await activePool.query(`
+      CREATE TABLE IF NOT EXISTS study_tool_cache (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        tool TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        notes_signature TEXT NOT NULL,
+        output JSONB NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE (user_id, tool, subject, notes_signature)
+      );
+    `);
+
+    await activePool.query(`
+      CREATE INDEX IF NOT EXISTS idx_study_tool_cache_lookup
+      ON study_tool_cache (user_id, tool, subject, notes_signature, updated_at DESC);
     `);
 
     await activePool.query(`
@@ -347,6 +379,11 @@ export const initDb = async () => {
     await activePool.query(`
       ALTER TABLE socratic_chat_messages
       ADD COLUMN IF NOT EXISTS thread_id TEXT REFERENCES socratic_chat_threads(id) ON DELETE CASCADE;
+    `);
+
+    await activePool.query(`
+      ALTER TABLE socratic_chat_messages
+      ADD COLUMN IF NOT EXISTS tutor_id TEXT;
     `);
 
     await activePool.query(`
@@ -500,6 +537,17 @@ const mapAssignmentPdf = (row) => ({
   updatedAt: Number(row.updated_at),
 });
 
+const mapAssignmentCaptureImage = (row) => ({
+  assignmentId: row.assignment_id,
+  userId: row.user_id,
+  blobName: row.blob_name,
+  fileName: row.file_name,
+  contentType: row.content_type,
+  size: Number(row.size),
+  uploadedAt: Number(row.uploaded_at),
+  updatedAt: Number(row.updated_at),
+});
+
 export const getAssignmentPdfByAssignmentId = async (userId, assignmentId) => {
   const { rows } = await getPool().query(
     `
@@ -513,6 +561,21 @@ export const getAssignmentPdfByAssignmentId = async (userId, assignmentId) => {
 
   if (rows.length === 0) return null;
   return mapAssignmentPdf(rows[0]);
+};
+
+export const getAssignmentCaptureImageByAssignmentId = async (userId, assignmentId) => {
+  const { rows } = await getPool().query(
+    `
+      SELECT assignment_id, user_id, blob_name, file_name, content_type, size, uploaded_at, updated_at
+      FROM assignment_capture_images
+      WHERE user_id = $1 AND assignment_id = $2
+      LIMIT 1;
+    `,
+    [userId, assignmentId],
+  );
+
+  if (rows.length === 0) return null;
+  return mapAssignmentCaptureImage(rows[0]);
 };
 
 export const upsertAssignmentPdf = async ({
@@ -546,6 +609,37 @@ export const upsertAssignmentPdf = async ({
   return mapAssignmentPdf(rows[0]);
 };
 
+export const upsertAssignmentCaptureImage = async ({
+  assignmentId,
+  userId,
+  blobName,
+  fileName,
+  contentType,
+  size,
+}) => {
+  const now = Date.now();
+  const { rows } = await getPool().query(
+    `
+      INSERT INTO assignment_capture_images (
+        assignment_id, user_id, blob_name, file_name, content_type, size, uploaded_at, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+      ON CONFLICT (assignment_id)
+      DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        blob_name = EXCLUDED.blob_name,
+        file_name = EXCLUDED.file_name,
+        content_type = EXCLUDED.content_type,
+        size = EXCLUDED.size,
+        uploaded_at = EXCLUDED.uploaded_at,
+        updated_at = EXCLUDED.updated_at
+      RETURNING assignment_id, user_id, blob_name, file_name, content_type, size, uploaded_at, updated_at;
+    `,
+    [assignmentId, userId, blobName, fileName, contentType, size, now],
+  );
+  return mapAssignmentCaptureImage(rows[0]);
+};
+
 export const removeAssignmentPdf = async (userId, assignmentId) => {
   const { rows } = await getPool().query(
     `
@@ -559,6 +653,19 @@ export const removeAssignmentPdf = async (userId, assignmentId) => {
   return mapAssignmentPdf(rows[0]);
 };
 
+export const removeAssignmentCaptureImage = async (userId, assignmentId) => {
+  const { rows } = await getPool().query(
+    `
+      DELETE FROM assignment_capture_images
+      WHERE user_id = $1 AND assignment_id = $2
+      RETURNING assignment_id, user_id, blob_name, file_name, content_type, size, uploaded_at, updated_at;
+    `,
+    [userId, assignmentId],
+  );
+  if (rows.length === 0) return null;
+  return mapAssignmentCaptureImage(rows[0]);
+};
+
 export const listAssignmentPdfsForUser = async (userId) => {
   const { rows } = await getPool().query(
     `
@@ -569,6 +676,18 @@ export const listAssignmentPdfsForUser = async (userId) => {
     [userId],
   );
   return rows.map(mapAssignmentPdf);
+};
+
+export const listAssignmentCaptureImagesForUser = async (userId) => {
+  const { rows } = await getPool().query(
+    `
+      SELECT assignment_id, user_id, blob_name, file_name, content_type, size, uploaded_at, updated_at
+      FROM assignment_capture_images
+      WHERE user_id = $1;
+    `,
+    [userId],
+  );
+  return rows.map(mapAssignmentCaptureImage);
 };
 
 export const getScene = async (userId, assignmentId, problemIndex) => {
@@ -1300,6 +1419,55 @@ export const upsertNotebookQuizSession = async (
   return mapNotebookQuizSession(rows[0]);
 };
 
+const mapStudyToolCache = (row) => ({
+  id: row.id,
+  userId: row.user_id,
+  tool: row.tool,
+  subject: row.subject,
+  notesSignature: row.notes_signature,
+  output: row.output,
+  createdAt: Number(row.created_at),
+  updatedAt: Number(row.updated_at),
+});
+
+export const getStudyToolCache = async (userId, { tool, subject, notesSignature }) => {
+  const { rows } = await getPool().query(
+    `
+      SELECT id, user_id, tool, subject, notes_signature, output, created_at, updated_at
+      FROM study_tool_cache
+      WHERE user_id = $1 AND tool = $2 AND subject = $3 AND notes_signature = $4
+      ORDER BY updated_at DESC
+      LIMIT 1;
+    `,
+    [userId, tool, subject, notesSignature],
+  );
+  if (rows.length === 0) return null;
+  return mapStudyToolCache(rows[0]);
+};
+
+export const upsertStudyToolCache = async (
+  userId,
+  { tool, subject, notesSignature, output },
+) => {
+  const now = Date.now();
+  const id = `${userId}:study-tool:${tool}:${subject}:${notesSignature}`;
+  const { rows } = await getPool().query(
+    `
+      INSERT INTO study_tool_cache (
+        id, user_id, tool, subject, notes_signature, output, created_at, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $7)
+      ON CONFLICT (user_id, tool, subject, notes_signature)
+      DO UPDATE SET
+        output = EXCLUDED.output,
+        updated_at = EXCLUDED.updated_at
+      RETURNING id, user_id, tool, subject, notes_signature, output, created_at, updated_at;
+    `,
+    [id, userId, tool, subject, notesSignature, JSON.stringify(output || null), now],
+  );
+  return mapStudyToolCache(rows[0]);
+};
+
 export const createProblemErrorAttempt = async (
   userId,
   assignmentId,
@@ -1762,6 +1930,7 @@ const mapSocraticChatMessage = (row) => ({
   threadId: row.thread_id,
   role: row.role === "assistant" ? "assistant" : "user",
   text: String(row.content || ""),
+  tutorId: row.tutor_id === "vaani" ? "vaani" : row.tutor_id === "saarthi" ? "saarthi" : null,
   createdAt: Number(row.created_at),
 });
 
@@ -1807,19 +1976,38 @@ export const listSocraticChatThreads = async (userId, limit = 50) => {
   return rows.map(mapSocraticChatThread);
 };
 
-export const insertSocraticChatMessage = async (userId, { threadId, role, text, createdAt = Date.now() }) => {
+export const removeSocraticChatThread = async (userId, threadId) => {
+  const safeThreadId = String(threadId || "").trim();
+  if (!safeThreadId) return null;
+  const { rows } = await getPool().query(
+    `
+      DELETE FROM socratic_chat_threads
+      WHERE user_id = $1 AND id = $2
+      RETURNING id, user_id, title, '' AS preview, created_at, updated_at;
+    `,
+    [userId, safeThreadId],
+  );
+  if (rows.length === 0) return null;
+  return mapSocraticChatThread(rows[0]);
+};
+
+export const insertSocraticChatMessage = async (
+  userId,
+  { threadId, role, text, createdAt = Date.now(), tutorId = null },
+) => {
   const safeRole = role === "assistant" ? "assistant" : "user";
   const safeText = String(text || "").trim();
   const safeCreatedAt = Number.isFinite(Number(createdAt)) ? Number(createdAt) : Date.now();
+  const safeTutorId = tutorId === "vaani" || tutorId === "saarthi" ? tutorId : null;
   const id = `socratic-msg-${safeCreatedAt}-${Math.random().toString(36).slice(2, 10)}`;
   const safeThreadId = String(threadId || "").trim();
   const { rows } = await getPool().query(
     `
-      INSERT INTO socratic_chat_messages (id, user_id, thread_id, role, content, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, user_id, thread_id, role, content, created_at;
+      INSERT INTO socratic_chat_messages (id, user_id, thread_id, role, content, tutor_id, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING id, user_id, thread_id, role, content, tutor_id, created_at;
     `,
-    [id, userId, safeThreadId, safeRole, safeText, safeCreatedAt],
+    [id, userId, safeThreadId, safeRole, safeText, safeTutorId, safeCreatedAt],
   );
   await getPool().query(
     `
@@ -1842,9 +2030,9 @@ export const listSocraticChatMessages = async (userId, threadId, limit = 200) =>
   const safeThreadId = String(threadId || "").trim();
   const { rows } = await getPool().query(
     `
-      SELECT id, user_id, thread_id, role, content, created_at
+      SELECT id, user_id, thread_id, role, content, tutor_id, created_at
       FROM (
-        SELECT id, user_id, thread_id, role, content, created_at
+        SELECT id, user_id, thread_id, role, content, tutor_id, created_at
         FROM socratic_chat_messages
         WHERE user_id = $1 AND thread_id = $2
         ORDER BY created_at DESC

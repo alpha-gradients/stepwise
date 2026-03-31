@@ -1,5 +1,5 @@
 import React from 'react';
-import { AlertTriangle, BarChart3, BrainCircuit, LayoutDashboard, NotebookPen, PanelTopOpen } from 'lucide-react';
+import { AlertTriangle, BarChart3, BrainCircuit, Gamepad2, LayoutDashboard, NotebookPen, PanelTopOpen, Settings, Shapes } from 'lucide-react';
 
 interface SidebarProps {
   currentPage: string;
@@ -48,31 +48,7 @@ export function Sidebar({
           onClick={() => handleNavigate('whiteboard')}
         >
           <span className="nav-icon"><PanelTopOpen size={20} /></span>
-          <span className="nav-label">AI Whiteboard</span>
-        </button>
-
-        <button
-          className={`nav-item ${currentPage === 'weak-areas' ? 'active' : ''}`}
-          onClick={() => handleNavigate('weak-areas')}
-        >
-          <span className="nav-icon"><AlertTriangle size={20} /></span>
-          <span className="nav-label">Weak Areas</span>
-        </button>
-
-        <button
-          className={`nav-item ${currentPage === 'progress-analytics' ? 'active' : ''}`}
-          onClick={() => handleNavigate('progress-analytics')}
-        >
-          <span className="nav-icon"><BarChart3 size={20} /></span>
-          <span className="nav-label">Progress Analytics</span>
-        </button>
-
-        <button
-          className={`nav-item ${currentPage === 'socratic-tutor' ? 'active' : ''}`}
-          onClick={() => handleNavigate('socratic-tutor')}
-        >
-          <span className="nav-icon"><BrainCircuit size={20} /></span>
-          <span className="nav-label">Socratic Tutor</span>
+          <span className="nav-label">AI whiteboard</span>
         </button>
 
         <button
@@ -80,63 +56,55 @@ export function Sidebar({
           onClick={() => handleNavigate('notes')}
         >
           <span className="nav-icon"><NotebookPen size={20} /></span>
-          <span className="nav-label">My Notes</span>
+          <span className="nav-label">My notes</span>
         </button>
 
         <button
-          className={`nav-item ${currentPage === 'flashcards' ? 'active' : ''}`}
-          onClick={() => handleNavigate('flashcards')}
+          className={`nav-item ${currentPage === 'study-tools' ? 'active' : ''}`}
+          onClick={() => handleNavigate('study-tools')}
         >
-          <span className="nav-icon">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
-              <rect x="3" y="5" width="14" height="10" rx="2" />
-              <path d="M7 8h6M7 12h4" strokeLinecap="round" />
-            </svg>
-          </span>
-          <span className="nav-label">Flashcards</span>
+          <span className="nav-icon"><Shapes size={20} /></span>
+          <span className="nav-label">Study tools</span>
         </button>
 
         <button
-          className={`nav-item ${currentPage === 'quiz' ? 'active' : ''}`}
-          onClick={() => handleNavigate('quiz')}
+          className={`nav-item ${currentPage === 'socratic-tutor' ? 'active' : ''}`}
+          onClick={() => handleNavigate('socratic-tutor')}
         >
-          <span className="nav-icon">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="10" cy="10" r="7" />
-              <path d="M8.5 8a1.5 1.5 0 1 1 2.6 1c-.6.5-1.1.9-1.1 1.8" strokeLinecap="round" />
-              <path d="M10 14h.01" strokeLinecap="round" />
-            </svg>
-          </span>
-          <span className="nav-label">Quizzes</span>
+          <span className="nav-icon"><BrainCircuit size={20} /></span>
+          <span className="nav-label">Socratic tutoring</span>
         </button>
 
         <button
-          className={`nav-item ${currentPage === 'mind-map' ? 'active' : ''}`}
-          onClick={() => handleNavigate('mind-map')}
+          className={`nav-item ${currentPage === 'weak-areas' ? 'active' : ''}`}
+          onClick={() => handleNavigate('weak-areas')}
         >
-          <span className="nav-icon">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="10" cy="4" r="2" />
-              <circle cx="4" cy="16" r="2" />
-              <circle cx="16" cy="16" r="2" />
-              <path d="M10 6v4M10 10l-6 4M10 10l6 4" strokeLinecap="round" />
-            </svg>
-          </span>
-          <span className="nav-label">Mind Maps</span>
+          <span className="nav-icon"><AlertTriangle size={20} /></span>
+          <span className="nav-label">Improvement Zones</span>
         </button>
 
         <button
-          className={`nav-item ${currentPage === 'revision-sheet' ? 'active' : ''}`}
-          onClick={() => handleNavigate('revision-sheet')}
+          className={`nav-item ${currentPage === 'progress-analytics' ? 'active' : ''}`}
+          onClick={() => handleNavigate('progress-analytics')}
         >
-          <span className="nav-icon">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M5 3h7l3 3v11a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" />
-              <path d="M12 3v4h4" />
-              <path d="M7 10h6M7 13h6" strokeLinecap="round" />
-            </svg>
-          </span>
-          <span className="nav-label">Revision Sheet</span>
+          <span className="nav-icon"><BarChart3 size={20} /></span>
+          <span className="nav-label">Progress analytics</span>
+        </button>
+
+        <button
+          className={`nav-item ${currentPage === 'refresh-zone' ? 'active' : ''}`}
+          onClick={() => handleNavigate('refresh-zone')}
+        >
+          <span className="nav-icon"><Gamepad2 size={20} /></span>
+          <span className="nav-label">Refresh Zone</span>
+        </button>
+
+        <button
+          className={`nav-item ${currentPage === 'settings' ? 'active' : ''}`}
+          onClick={() => handleNavigate('settings')}
+        >
+          <span className="nav-icon"><Settings size={20} /></span>
+          <span className="nav-label">Accessibility</span>
         </button>
       </nav>
     </div>

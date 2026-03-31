@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import {
   createReadSasUrl,
   deleteBlobIfExists,
+  downloadAssignmentCaptureFromBlob,
   downloadAssignmentPdfFromBlob,
   downloadProblemImageBufferFromBlob,
   downloadProblemImageFromBlob,
@@ -22,6 +23,7 @@ import {
   downloadNoteFileFromBlob,
   downloadNoteFileBufferFromBlob,
   uploadAssignmentPdfToBlob,
+  uploadAssignmentCaptureToBlob,
   uploadProblemImageToBlob,
   uploadProblemSceneToBlob,
   uploadNoteFileToBlob,
@@ -30,9 +32,11 @@ import {
   createProblemErrorAttempt,
   deleteUserData,
   findAssignmentById,
+  getStudyToolCache,
   getNotebookQuizSession,
   getProblemProgress,
   getAssignmentPdfByAssignmentId,
+  getAssignmentCaptureImageByAssignmentId,
   getProblemContext,
   getProblemImage,
   getScene,
@@ -41,6 +45,7 @@ import {
   listNotebookQuizSessions,
   listProblemProgressForAssignment,
   listAssignmentPdfsForUser,
+  listAssignmentCaptureImagesForUser,
   listProblemErrorAttempts,
   listProblemErrorSummary,
   listProblemImageBlobNamesForAssignment,
@@ -54,8 +59,10 @@ import {
   removeProblemTitle,
   removeScene,
   upsertNotebookQuizSession,
+  upsertStudyToolCache,
   upsertProblemProgress,
   removeAssignmentPdf,
+  removeAssignmentCaptureImage,
   removeAssignment,
   setAssignmentProblemCount,
   setProblemTitle,
@@ -64,6 +71,7 @@ import {
   upsertProblemContext,
   upsertProblemImage,
   upsertAssignmentPdf,
+  upsertAssignmentCaptureImage,
   upsertScene,
   upsertUser,
   listNotebookSubjects,
@@ -77,6 +85,7 @@ import {
   createSocraticChatThread,
   insertNotebookNote,
   insertSocraticChatMessage,
+  removeSocraticChatThread,
   updateNotebookNote,
   removeNotebookNote,
   listAllNotebookNotesForUser,
@@ -135,13 +144,123 @@ const extractTextFromPdfBuffer = async (buffer) => {
 const MAX_PDF_IMAGES_PER_BLOB = 1;
 const MAX_RETRIEVED_SOURCE_IMAGES = 3;
 const MAX_RETRIEVED_SOURCE_BLOBS = 2;
+const MAX_TEXT_CONTEXT_RESULTS = 3;
+const MAX_NOTE_CONTEXT_CHARS = 1800;
 const VISUAL_QUERY_HINT_REGEX =
   /\b(image|photo|diagram|graph|figure|chart|table|draw|drawing|shown|see|visual|look at|looks like)\b/i;
 const QR_OR_BARCODE_HINT_REGEX =
   /\b(qr|barcode|scan code|scan this|upi|paytm|gpay|whatsapp web|scan to pay)\b/i;
+const SMALL_TALK_QUERY_REGEX =
+  /^(hi|hello|hey|yo|hola|sup|thanks|thank you|ok|okay|again|hmm|huh|cool|nice|great)\b/i;
 const containsQrLikeHints = (value) => QR_OR_BARCODE_HINT_REGEX.test(String(value || ""));
 const shouldUseRetrievedSourceImages = (query, userImages) =>
   userImages.length === 0 && VISUAL_QUERY_HINT_REGEX.test(String(query || ""));
+const normalizeIntentQuery = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+const shouldUseNotesSearchForQuery = ({ query, hasAudio, imageCount }) => {
+  if (hasAudio) return { enabled: false, reason: "audio_request" };
+  if (Number(imageCount) > 0) return { enabled: false, reason: "image_request" };
+
+  const normalized = normalizeIntentQuery(query);
+  if (!normalized) return { enabled: false, reason: "empty_query" };
+  if (SMALL_TALK_QUERY_REGEX.test(normalized)) {
+    return { enabled: false, reason: "small_talk_query" };
+  }
+
+  const words = normalized.split(" ").filter(Boolean);
+  const hasMathHints = /\d|[=+\-*/^()]/.test(String(query || ""));
+  if (!hasMathHints && words.length <= 2 && normalized.length <= 10) {
+    return { enabled: false, reason: "short_non_math_query" };
+  }
+
+  return { enabled: true, reason: "content_query" };
+};
+
+const APP_LANGUAGE_LABELS = {
+  en: "English",
+  es: "Spanish",
+  fr: "French",
+  de: "German",
+  hi: "Hindi",
+  te: "Telugu",
+  ta: "Tamil",
+};
+
+const getAppLanguageCode = (value) => {
+  const normalized = String(value || "").trim().toLowerCase();
+  return APP_LANGUAGE_LABELS[normalized] ? normalized : "en";
+};
+
+const getAppLanguageInstruction = (languageCode, options = {}) => {
+  const normalized = getAppLanguageCode(languageCode);
+  if (normalized === "en") return "";
+
+  const languageLabel = APP_LANGUAGE_LABELS[normalized] || "English";
+  const preserveJson = options.preserveJson === true;
+  const preserveMath = options.preserveMath !== false;
+  const preserveEntityNames = options.preserveEntityNames === true;
+
+  const instructions = [`Respond entirely in ${languageLabel}.`];
+  if (preserveMath) {
+    instructions.push("Keep mathematical symbols, equations, and LaTeX notation unchanged where appropriate.");
+  }
+  if (preserveEntityNames) {
+    instructions.push("Keep notebook names and assignment names exactly as provided. Do not translate, transliterate, or paraphrase those names.");
+  }
+  if (preserveJson) {
+    instructions.push("Keep JSON field names and required output schema exactly as requested.");
+  }
+  return instructions.join(" ");
+};
+
+const getLocalizedMessage = (key, languageCode) => {
+  const normalized = getAppLanguageCode(languageCode);
+  const messages = {
+    unreadable_hint: {
+      en: "I couldn't read the step. Please rewrite it clearly and show the full equation or expression.",
+      es: "No pude leer el paso. Por favor, escríbelo con claridad y muestra la ecuación o expresión completa.",
+      fr: "Je n'ai pas pu lire l'étape. Réécris-la clairement et montre l'équation ou l'expression complète.",
+      de: "Ich konnte den Schritt nicht lesen. Bitte schreibe ihn deutlich und zeige die vollständige Gleichung oder den Ausdruck.",
+      hi: "मैं इस चरण को पढ़ नहीं सका। कृपया इसे साफ़-साफ़ दोबारा लिखें और पूरी समीकरण या व्यंजक दिखाएँ।",
+      te: "నేను ఈ దశను చదవలేకపోయాను. దయచేసి దీనిని స్పష్టంగా మళ్లీ వ్రాసి పూర్తి సమీకరణం లేదా వ్యక్తీకరణను చూపించండి.",
+      ta: "இந்த படியை நான் படிக்க முடியவில்லை. தயவுசெய்து இதை தெளிவாக மீண்டும் எழுதி முழு சமன்பாடு அல்லது வெளிப்பாட்டைக் காட்டுங்கள்.",
+    },
+    unreadable_calculation: {
+      en: "I could not reliably read the selected expression. Select a tighter area or write it more clearly.",
+      es: "No pude leer con confianza la expresión seleccionada. Selecciona un área más precisa o escríbela con más claridad.",
+      fr: "Je n'ai pas pu lire correctement l'expression sélectionnée. Sélectionne une zone plus précise ou écris-la plus clairement.",
+      de: "Ich konnte den ausgewählten Ausdruck nicht zuverlässig lesen. Wähle einen engeren Bereich oder schreibe ihn deutlicher.",
+      hi: "मैं चुनी गई अभिव्यक्ति को ठीक से पढ़ नहीं सका। थोड़ा छोटा क्षेत्र चुनें या इसे और साफ़ लिखें।",
+      te: "ఎంచుకున్న వ్యక్తీకరణను నేను నమ్మకంగా చదవలేకపోయాను. మరింత చిన్న భాగాన్ని ఎంచుకోండి లేదా దాన్ని ఇంకా స్పష్టంగా వ్రాయండి.",
+      ta: "தேர்ந்தெடுக்கப்பட்ட வெளிப்பாட்டை நான் நம்பத்தகுந்த வகையில் படிக்க முடியவில்லை. இன்னும் குறுகிய பகுதியைத் தேர்ந்தெடுக்கவும் அல்லது அதை மேலும் தெளிவாக எழுதவும்.",
+    },
+  };
+
+  return messages[key]?.[normalized] || messages[key]?.en || "";
+};
+
+const buildBoundedNoteContext = (searchResults) => {
+  if (!Array.isArray(searchResults) || searchResults.length === 0) return "";
+  const lines = ["Relevant notes context from student's notebook:"];
+  for (let i = 0; i < searchResults.length && i < MAX_TEXT_CONTEXT_RESULTS; i += 1) {
+    const res = searchResults[i] || {};
+    const title = String(res.title || "").trim().slice(0, 140) || "Untitled note";
+    const snippet = String(res.chunkText || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 420);
+    if (!snippet) continue;
+    const block = `[${i + 1}] Title: ${title}\nContent snippet: ${snippet}`;
+    if (`${lines.join("\n\n")}\n\n${block}`.length > MAX_NOTE_CONTEXT_CHARS) break;
+    lines.push(block);
+  }
+  return lines.length > 1 ? lines.join("\n\n") : "";
+};
+
 const extractImagesFromPdfBuffer = async (buffer) => {
   if (!PdfParseCtor || !buffer) return [];
 
@@ -292,10 +411,22 @@ const getAzureConfig = () => {
   const endpoint = trimTrailingSlash(readEnv("AZURE_OPENAI_ENDPOINT"));
   const apiKey = readEnv("AZURE_OPENAI_API_KEY");
   const apiVersion = readEnv("AZURE_OPENAI_API_VERSION") || "2024-02-01";
-  const deployment =
-    readEnv("AZURE_OPENAI_MODEL") ||
-    readEnv("AZURE_OPENAI_DEPLOYMENT") ||
-    readEnv("AZURE_OPENAI_DEPLOYMENT_NAME");
+  const fallbackDeployments = readEnv("AZURE_OPENAI_FALLBACK_DEPLOYMENTS")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const deployments = Array.from(
+    new Set(
+      [
+        readEnv("AZURE_OPENAI_DEPLOYMENT"),
+        readEnv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+        readEnv("AZURE_OPENAI_CHAT_DEPLOYMENT"),
+        readEnv("AZURE_OPENAI_MODEL"),
+        ...fallbackDeployments,
+      ].filter(Boolean),
+    ),
+  );
+  const deployment = deployments[0] || "";
 
   const missing = [];
   if (!endpoint) missing.push("AZURE_OPENAI_ENDPOINT");
@@ -311,6 +442,35 @@ const getAzureConfig = () => {
     apiKey,
     apiVersion,
     deployment,
+    deployments,
+  };
+};
+
+const isMissingAzureDeploymentError = (status, detail) =>
+  Number(status) === 404 &&
+  /could not find an existing deployment|deployment/i.test(String(detail || ""));
+
+const getAzureTranslatorConfig = () => {
+  const endpoint = trimTrailingSlash(
+    readEnv("AZURE_TRANSLATOR_ENDPOINT") || "https://api.cognitive.microsofttranslator.com",
+  );
+  const documentEndpoint = trimTrailingSlash(readEnv("AZURE_DOCUMENT_TRANSLATOR_ENDPOINT"));
+  const apiKey = readEnv("AZURE_TRANSLATOR_KEY");
+  const region = readEnv("AZURE_TRANSLATOR_REGION");
+
+  const missing = [];
+  if (!apiKey) missing.push("AZURE_TRANSLATOR_KEY");
+  if (!endpoint) missing.push("AZURE_TRANSLATOR_ENDPOINT");
+
+  if (missing.length > 0) {
+    throw new Error(`Azure Translator is not configured. Missing: ${missing.join(", ")}`);
+  }
+
+  return {
+    endpoint,
+    documentEndpoint,
+    apiKey,
+    region,
   };
 };
 
@@ -398,43 +558,454 @@ const formatProblemContextForHint = (rawContext) => {
   return lines.join("\n");
 };
 
-const buildUnreadableHint = (rawContext) => {
+const buildUnreadableHint = (rawContext, languageCode = "en") => {
   const parsed =
     rawContext && typeof rawContext === "object" && !Array.isArray(rawContext)
       ? rawContext
       : safeJsonParse(rawContext);
   const goal = parsed?.goal ? String(parsed.goal).trim() : "";
   if (goal) {
-    return `I couldn't read the step. Please rewrite it clearly and show how it moves toward: ${goal}.`;
+    const introByLanguage = {
+      en: "I couldn't read the step. Please rewrite it clearly and show how it moves toward:",
+      es: "No pude leer el paso. Por favor, escríbelo con claridad y muestra cómo avanza hacia:",
+      fr: "Je n'ai pas pu lire l'étape. Réécris-la clairement et montre comment elle mène à :",
+      de: "Ich konnte den Schritt nicht lesen. Bitte schreibe ihn deutlich und zeige, wie er zu Folgendem führt:",
+      hi: "मैं इस चरण को पढ़ नहीं सका। कृपया इसे साफ़-साफ़ दोबारा लिखें और दिखाएँ कि यह किस तरह यहाँ तक पहुँचता है:",
+      te: "నేను ఈ దశను చదవలేకపోయాను. దయచేసి దీనిని స్పష్టంగా మళ్లీ వ్రాసి ఇది ఈ లక్ష్యానికి ఎలా దారి తీస్తుందో చూపించండి:",
+      ta: "இந்த படியை நான் படிக்க முடியவில்லை. தயவுசெய்து இதை தெளிவாக மீண்டும் எழுதி இது எவ்வாறு இதை நோக்கிச் செல்கிறது என்பதை காட்டுங்கள்:",
+    };
+    const normalized = getAppLanguageCode(languageCode);
+    return `${introByLanguage[normalized] || introByLanguage.en} ${goal}.`;
   }
-  return "I couldn't read the step. Please rewrite it clearly and show the full equation or expression.";
+  return getLocalizedMessage("unreadable_hint", languageCode);
 };
 
-const requestAzureChatCompletion = async ({ messages, maxTokens = 200, temperature = 0.3 }) => {
-  const { endpoint, apiKey, apiVersion, deployment } = getAzureConfig();
-  const response = await fetch(
-    `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "api-key": apiKey,
-      },
-      body: JSON.stringify({
-        temperature,
-        max_completion_tokens: maxTokens,
-        messages,
-      }),
-    },
-  );
+const isAzureDebugEnabled = () => {
+  const flag = readEnv("STEPWISE_AZURE_DEBUG").toLowerCase();
+  return flag === "true" || flag === "1" || flag === "yes";
+};
 
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`Azure OpenAI request failed (${response.status}). ${detail}`.trim());
+const summarizeMessagesForDebug = (messages) => {
+  if (!Array.isArray(messages)) {
+    return { messageCount: 0, estimatedTextChars: 0, imageParts: 0, audioParts: 0 };
+  }
+  let estimatedTextChars = 0;
+  let imageParts = 0;
+  let audioParts = 0;
+
+  for (const message of messages) {
+    const content = message?.content;
+    if (typeof content === "string") {
+      estimatedTextChars += content.length;
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      const type = String(part?.type || "");
+      if (type === "text") {
+        estimatedTextChars += String(part?.text || "").length;
+      } else if (type === "image_url") {
+        imageParts += 1;
+      } else if (type === "input_audio") {
+        audioParts += 1;
+      }
+    }
   }
 
-  const payload = await response.json();
-  return payload?.choices?.[0]?.message?.content?.trim() || "No hint available yet.";
+  return {
+    messageCount: messages.length,
+    estimatedTextChars,
+    imageParts,
+    audioParts,
+  };
+};
+
+const getAzureRequestIdFromHeaders = (headers) =>
+  headers?.get("x-request-id") ||
+  headers?.get("apim-request-id") ||
+  headers?.get("x-ms-request-id") ||
+  "";
+
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const clampSafetySeverity = (value, fallback) => {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(6, parsed));
+};
+
+const getContentSafetyConfig = () => ({
+  endpoint: trimTrailingSlash(readEnv("AZURE_CONTENT_SAFETY_ENDPOINT")),
+  apiKey: readEnv("AZURE_CONTENT_SAFETY_KEY"),
+  apiVersion: readEnv("AZURE_CONTENT_SAFETY_API_VERSION") || "2024-09-01",
+  blockSeverity: clampSafetySeverity(readEnv("AZURE_CONTENT_SAFETY_BLOCK_SEVERITY"), 4),
+  reviewSeverity: clampSafetySeverity(readEnv("AZURE_CONTENT_SAFETY_REVIEW_SEVERITY"), 2),
+  failOpen: !["false", "0", "no"].includes(readEnv("CONTENT_SAFETY_FAIL_OPEN").toLowerCase()),
+});
+
+const CONTENT_SAFETY_REQUEST_TIMEOUT_MS = parsePositiveInt(
+  readEnv("CONTENT_SAFETY_REQUEST_TIMEOUT_MS"),
+  10000,
+);
+const CONTENT_SAFETY_FAILURE_COOLDOWN_MS = parsePositiveInt(
+  readEnv("CONTENT_SAFETY_FAILURE_COOLDOWN_MS"),
+  60000,
+);
+let contentSafetyFailOpenUntil = 0;
+
+const normalizeContentSafetyCategories = (rawCategories) => {
+  if (!Array.isArray(rawCategories)) return [];
+  return rawCategories
+    .map((item) => ({
+      category: String(item?.category || "").trim(),
+      severity: Number.parseInt(String(item?.severity || "0"), 10) || 0,
+    }))
+    .filter((item) => item.category);
+};
+
+const decideContentSafetyAction = ({ categories, blockSeverity, reviewSeverity }) => {
+  const reasonCodes = [];
+  let action = "allow";
+  for (const item of categories) {
+    if (item.severity >= blockSeverity) {
+      action = "block";
+      reasonCodes.push(`${item.category}:${item.severity}`);
+      continue;
+    }
+    if (action !== "block" && item.severity >= reviewSeverity) {
+      action = "review";
+      reasonCodes.push(`${item.category}:${item.severity}`);
+    }
+  }
+  return { action, reasonCodes };
+};
+
+const moderateViaAzureContentSafety = async ({ kind, payload, context, failOpenMessage }) => {
+  const { endpoint, apiKey, apiVersion, blockSeverity, reviewSeverity, failOpen } = getContentSafetyConfig();
+  if (!endpoint || !apiKey) {
+    return { enforced: false, skipped: true, action: "allow", categories: [], reasonCodes: [] };
+  }
+  if (failOpen && Date.now() < contentSafetyFailOpenUntil) {
+    return { enforced: false, skipped: true, action: "allow", categories: [], reasonCodes: [] };
+  }
+
+  const path =
+    kind === "image"
+      ? `/contentsafety/image:analyze?api-version=${encodeURIComponent(apiVersion)}`
+      : `/contentsafety/text:analyze?api-version=${encodeURIComponent(apiVersion)}`;
+  const requestUrl = `${endpoint}${path}`;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONTENT_SAFETY_REQUEST_TIMEOUT_MS);
+    let moderationResponse;
+    try {
+      moderationResponse = await fetch(requestUrl, {
+        method: "POST",
+        headers: {
+          "Ocp-Apim-Subscription-Key": apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (!moderationResponse.ok) {
+      const detail = await moderationResponse.text().catch(() => "");
+      throw new Error(`Moderation service failed (${moderationResponse.status}). ${detail}`.trim());
+    }
+
+    const result = await moderationResponse.json().catch(() => ({}));
+    const categories = normalizeContentSafetyCategories(result?.categoriesAnalysis);
+    const decision = decideContentSafetyAction({
+      categories,
+      blockSeverity,
+      reviewSeverity,
+    });
+    return {
+      enforced: true,
+      skipped: false,
+      action: decision.action,
+      categories,
+      reasonCodes: decision.reasonCodes,
+    };
+  } catch (error) {
+    const message =
+      error?.name === "AbortError"
+        ? `Moderation request timed out after ${CONTENT_SAFETY_REQUEST_TIMEOUT_MS}ms`
+        : error?.message || String(error);
+    if (failOpen) {
+      contentSafetyFailOpenUntil = Date.now() + CONTENT_SAFETY_FAILURE_COOLDOWN_MS;
+    }
+    console.error(failOpenMessage || "Content Safety request failed:", {
+      context,
+      endpoint: requestUrl,
+      message,
+      failOpen,
+      retryAfterMs: failOpen ? CONTENT_SAFETY_FAILURE_COOLDOWN_MS : 0,
+    });
+    if (failOpen) {
+      return { enforced: false, skipped: true, action: "allow", categories: [], reasonCodes: [] };
+    }
+    throw new Error(message);
+  }
+};
+
+const moderateTextInput = async (text, context) =>
+  moderateViaAzureContentSafety({
+    kind: "text",
+    context,
+    failOpenMessage: "Text moderation request failed",
+    payload: {
+      text: String(text || ""),
+    },
+  });
+
+const moderateImageInput = async (buffer, mimeType, context) =>
+  moderateViaAzureContentSafety({
+    kind: "image",
+    context,
+    failOpenMessage: "Image moderation request failed",
+    payload: {
+      image: {
+        content: Buffer.from(buffer).toString("base64"),
+      },
+    },
+  });
+
+const formatModerationMessage = (subject = "content") =>
+  `This ${subject} could not be accepted because it may violate safety policy.`;
+
+const shouldBlockModerationResult = (result) => String(result?.action || "") === "block";
+
+const buildStudyFocusModerationReply = (languageCode = "en") => {
+  const normalized = getAppLanguageCode(languageCode);
+  const replies = {
+    en: "That question is not appropriate here. Please avoid such requests and focus on your studies, and I will gladly help with learning.",
+    es: "Esa pregunta no es apropiada aquí. Evita ese tipo de solicitudes y concéntrate en tus estudios; con gusto te ayudaré a aprender.",
+    fr: "Cette question n'est pas appropriée ici. Merci d'éviter ce type de demande et de rester concentré sur tes études, et je t'aiderai volontiers à apprendre.",
+    de: "Diese Frage ist hier nicht angemessen. Bitte vermeide solche Anfragen und konzentriere dich auf dein Lernen, dann helfe ich dir gern weiter.",
+    hi: "यह प्रश्न यहाँ उचित नहीं है। कृपया ऐसे सवाल न पूछें और अपनी पढ़ाई पर ध्यान दें, मैं खुशी से आपकी पढ़ाई में मदद करूंगा।",
+    te: "ఈ ప్రశ్న ఇక్కడ సరైనది కాదు. దయచేసి ఇలాంటి ప్రశ్నలు అడగకుండా చదువుపై దృష్టి పెట్టండి, నేను మీకు చదువులో సంతోషంగా సహాయం చేస్తాను.",
+    ta: "இந்த கேள்வி இங்கே பொருத்தமானது அல்ல. தயவுசெய்து இப்படிப்பட்ட கேள்விகளை தவிர்த்து படிப்பில் கவனம் செலுத்துங்கள்; நான் மகிழ்ச்சியுடன் உங்கள் படிப்புக்கு உதவுவேன்.",
+  };
+
+  return replies[normalized] || replies.en;
+};
+
+const buildNoteModerationMessage = () =>
+  "This note contains inappropriate or unrelated content. Please upload or save only relevant study notes and try again.";
+
+const NOTE_SAFETY_PATTERNS = [
+  {
+    label: "Violence or threats",
+    regex: /\b(kill|murder|shoot|stab|bomb|attack|hurt you|beat you|threaten)\b/i,
+  },
+  {
+    label: "Self-harm",
+    regex: /\b(suicide|self[-\s]?harm|cut myself|kill myself|end my life)\b/i,
+  },
+  {
+    label: "Sexual content",
+    regex: /\b(sex|sexual|nude|naked|porn|explicit)\b/i,
+  },
+  {
+    label: "Hate or abuse",
+    regex: /\b(hate\s+\w+|slur|racist|terrorist|idiot|stupid loser|worthless)\b/i,
+  },
+  {
+    label: "Drugs or substance abuse",
+    regex: /\b(cocaine|heroin|meth|weed|drugs|overdose)\b/i,
+  },
+  {
+    label: "Inappropriate harm-related question",
+    regex: /\b(can|could|should|how)\b[^.?!\n]{0,80}\b(cook|burn|hurt|kill|injure|harm)\b[^.?!\n]{0,80}\b(human|person|body|people)\b/i,
+  },
+  {
+    label: "Irrelevant inappropriate content",
+    regex: /\b(cook a human|human in a camp cooker|hurt a person|kill a person)\b/i,
+  },
+];
+
+const truncateExcerpt = (value, maxLength = 180) => {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+};
+
+const splitNoteIntoSafetySegments = (content) => {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text) return [];
+
+  return text
+    .split(/(?<=[.?!])\s+|(?:--\s*\d+\s+of\s+\d+\s*--)/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+};
+
+const extractFlaggedNoteSegments = (content, maxSegments = 5) => {
+  const matches = [];
+  const seen = new Set();
+  const segments = splitNoteIntoSafetySegments(content);
+
+  for (const line of segments) {
+    for (const pattern of NOTE_SAFETY_PATTERNS) {
+      if (!pattern.regex.test(line)) continue;
+      const excerpt = truncateExcerpt(line);
+      const key = `${pattern.label}:${excerpt.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      matches.push({
+        label: pattern.label,
+        excerpt,
+      });
+      if (matches.length >= maxSegments) {
+        return matches;
+      }
+    }
+  }
+
+  return matches;
+};
+
+const analyzeNoteContentSafety = async (content) => {
+  const moderation = await moderateTextInput(String(content || "").slice(0, 12000), "notes_insight_scan");
+  const flaggedSegments = extractFlaggedNoteSegments(content);
+  const detected =
+    moderation.action === "review" ||
+    moderation.action === "block" ||
+    moderation.reasonCodes.length > 0 ||
+    flaggedSegments.length > 0;
+
+  return {
+    detected,
+    action: moderation.action,
+    categories: Array.isArray(moderation.categories) ? moderation.categories : [],
+    reasonCodes: Array.isArray(moderation.reasonCodes) ? moderation.reasonCodes : [],
+    flaggedSegments,
+    message: detected
+      ? "Inappropriate or harmful content was detected in this note. This type of content should not be written in study notes."
+      : "",
+  };
+};
+
+const isLocallyUnsafeOrIrrelevantStudyMessage = (value) => {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return NOTE_SAFETY_PATTERNS.some((pattern) => pattern.regex.test(text));
+};
+
+const requestAzureChatCompletion = async ({
+  messages,
+  maxTokens = 200,
+  temperature = 0.3,
+  debugTag = "general",
+  debugMeta = null,
+}) => {
+  const { endpoint, apiKey, apiVersion, deployments } = getAzureConfig();
+  let payload = null;
+  let deployment = deployments[0] || "";
+  let requestId = "";
+  let lastFailure = null;
+
+  for (const candidateDeployment of deployments) {
+    const response = await fetch(
+      `${endpoint}/openai/deployments/${encodeURIComponent(candidateDeployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api-key": apiKey,
+        },
+        body: JSON.stringify({
+          temperature,
+          max_completion_tokens: maxTokens,
+          messages,
+        }),
+      },
+    );
+
+    requestId = getAzureRequestIdFromHeaders(response.headers);
+    deployment = candidateDeployment;
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      const failure = {
+        debugTag,
+        status: response.status,
+        requestId,
+        detail: String(detail || "").slice(0, 600),
+        deployment: candidateDeployment,
+        apiVersion,
+        ...summarizeMessagesForDebug(messages),
+        ...(debugMeta && typeof debugMeta === "object" ? debugMeta : {}),
+      };
+
+      if (
+        isMissingAzureDeploymentError(response.status, detail) &&
+        candidateDeployment !== deployments[deployments.length - 1]
+      ) {
+        console.warn("Azure deployment unavailable, trying fallback", failure);
+        lastFailure = failure;
+        continue;
+      }
+
+      console.error("Azure OpenAI request failed", failure);
+      throw new Error(`Azure OpenAI request failed (${response.status}). ${detail}`.trim());
+    }
+
+    payload = await response.json();
+    if (candidateDeployment !== deployments[0]) {
+      console.warn("Azure OpenAI fallback deployment succeeded", {
+        debugTag,
+        deployment: candidateDeployment,
+        previousFailure: lastFailure?.deployment || null,
+      });
+    }
+    break;
+  }
+
+  if (!payload) {
+    throw new Error("Azure OpenAI request failed before receiving a valid response.");
+  }
+
+  const choice = payload?.choices?.[0] || {};
+  const rawContent = choice?.message?.content;
+  const content = typeof rawContent === "string" ? rawContent.trim() : "";
+  if (content) {
+    return content;
+  }
+
+  const emptyMeta = {
+    debugTag,
+    requestId,
+    status: 200,
+    deployment,
+    apiVersion,
+    finishReason: choice?.finish_reason || "unknown",
+    refusal: choice?.message?.refusal || null,
+    contentFilterResults: choice?.content_filter_results || payload?.prompt_filter_results || null,
+    usage: payload?.usage || null,
+    ...summarizeMessagesForDebug(messages),
+    ...(debugMeta && typeof debugMeta === "object" ? debugMeta : {}),
+  };
+
+  console.warn("Azure OpenAI returned empty message content", emptyMeta);
+  if (isAzureDebugEnabled()) {
+    console.log("Azure empty payload snapshot", {
+      ...emptyMeta,
+      payloadKeys: Object.keys(payload || {}),
+      choiceKeys: Object.keys(choice || {}),
+    });
+  }
+  return "No hint available yet.";
 };
 
 const analyzeProblemContextWithAzure = async (
@@ -470,6 +1041,50 @@ Rules:
 - Be concise.
 - Do not include explanations.
 - Do not include tutoring instructions.
+            `.trim(),
+          },
+          createImageUrlPart(buffer, mimeType),
+        ],
+      },
+    ],
+  });
+
+const clampUnit = (value, fallback) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.min(1, numeric));
+};
+
+const detectProblemRegionsWithAzure = async (buffer, mimeType = "image/png") =>
+  requestAzureChatCompletion({
+    maxTokens: 700,
+    temperature: 0.1,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `
+You are detecting separate math questions on a worksheet image.
+
+Return JSON only in this shape:
+{
+  "problems": [
+    {
+      "label": "Problem 1",
+      "bounds": { "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 }
+    }
+  ]
+}
+
+Rules:
+- bounds are normalized from 0 to 1 relative to the full image.
+- Include one item per clearly separate question area.
+- Sort from top to bottom, then left to right.
+- Keep each crop tight but include the full statement needed to solve the question.
+- If the sheet appears to contain a single question, return one problem covering that question.
+- Do not include any text outside JSON.
             `.trim(),
           },
           createImageUrlPart(buffer, mimeType),
@@ -524,6 +1139,7 @@ const generateHintWithAzure = async ({
   studentAnalysis,
   hintLevel = 1,
   previousHints = [],
+  outputLanguage = "en",
 }) => {
   const analysis =
     studentAnalysis && typeof studentAnalysis === "object"
@@ -571,6 +1187,7 @@ Behavior:
 - Avoid generic advice if context is available.
 Never reveal the final answer unless hint level is 4.
 Maximum 2 sentences. Use LaTeX for equations.
+${getAppLanguageInstruction(outputLanguage)}
         `,
       },
     ],
@@ -581,6 +1198,7 @@ const generateErrorFeedbackWithAzure = async ({
   problemContext,
   drawingBuffer,
   drawingMimeType = "image/png",
+  outputLanguage = "en",
 }) => {
   const raw = await requestAzureChatCompletion({
     temperature: 0,
@@ -599,13 +1217,19 @@ ${problemContext || "None"}
 
 Return exactly one of these two formats only:
 1. No
-2. Yes: <short error description>
+2. Yes
+Step: <the specific step or expression you believe is wrong>
+Summary: <short error description>
+Reason: <one short explanation of why this step is wrong>
 
 Rules:
 - Only answer "Yes" if there is a clear mathematical error in the written step.
 - Do not provide hints, corrections, next steps, or the final answer.
-- Keep the error description short and specific.
+- The step should quote the expression or transformation you think is incorrect.
+- Keep the summary short and specific.
+- The reason must explain what makes the shown step incorrect.
 - Do not return JSON.
+${getAppLanguageInstruction(outputLanguage)}
             `.trim(),
           },
           createImageUrlPart(drawingBuffer, drawingMimeType),
@@ -616,20 +1240,44 @@ Rules:
 
   const cleaned = String(raw || "").trim();
   if (/^no\b/i.test(cleaned)) {
-    return { hasError: false, error: "" };
+    return { hasError: false, error: "", reason: "", observedStep: "" };
+  }
+
+  const structuredMatch = cleaned.match(
+    /^yes\b[\s\S]*?step\s*:\s*(.+?)\s*(?:\n+|\r\n+)summary\s*:\s*(.+?)\s*(?:\n+|\r\n+)reason\s*:\s*([\s\S]+)$/i,
+  );
+  if (structuredMatch?.[1]) {
+    return {
+      hasError: true,
+      observedStep:
+        normalizeBoundedText(structuredMatch[1], MAX_OBSERVED_STEP_LENGTH) ||
+        "Unreadable",
+      error:
+        normalizeBoundedText(structuredMatch[2], MAX_MISTAKE_SUMMARY_LENGTH) ||
+        "There is an error in this step.",
+      reason:
+        normalizeBoundedText(structuredMatch[3], MAX_WHY_WRONG_LENGTH) ||
+        normalizeBoundedText(structuredMatch[2], MAX_WHY_WRONG_LENGTH) ||
+        "This step does not match the correct math.",
+    };
   }
 
   const yesMatch = cleaned.match(/^yes\s*:\s*(.+)$/i);
   if (yesMatch?.[1]) {
+    const fallback = normalizeBoundedText(yesMatch[1], MAX_WHY_WRONG_LENGTH);
     return {
       hasError: true,
-      error: normalizeBoundedText(yesMatch[1], MAX_WHY_WRONG_LENGTH) || "There is an error in this step.",
+      observedStep: "",
+      error: normalizeBoundedText(yesMatch[1], MAX_MISTAKE_SUMMARY_LENGTH) || "There is an error in this step.",
+      reason: fallback || "This step does not match the correct math.",
     };
   }
 
   return {
     hasError: false,
     error: "",
+    reason: "",
+    observedStep: "",
   };
 };
 
@@ -637,6 +1285,7 @@ const calculateSelectionWithAzure = async ({
   drawingBuffer,
   drawingMimeType = "image/png",
   problemContext = "",
+  outputLanguage = "en",
 }) => {
   const raw = await requestAzureChatCompletion({
     temperature: 0,
@@ -665,6 +1314,7 @@ Rules:
 - Do not guess missing symbols, numbers, or operators.
 - Simplify exact arithmetic when possible.
 - No explanation outside the JSON.
+${getAppLanguageInstruction(outputLanguage, { preserveJson: true })}
             `.trim(),
           },
           createImageUrlPart(drawingBuffer, drawingMimeType),
@@ -692,11 +1342,83 @@ Rules:
   }
 };
 
+const simplifyQuestionWithAzure = async ({
+  drawingBuffer,
+  drawingMimeType = "image/png",
+  problemContext = "",
+  outputLanguage = "en",
+}) => {
+  const raw = await requestAzureChatCompletion({
+    temperature: 0.2,
+    maxTokens: 120,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `
+Read the math question shown in this image and rewrite only what the question is asking in simple language.
+
+Problem context:
+${problemContext || "None"}
+
+Return JSON only with this field:
+- explanation: a 1-2 line plain-language description starting with "This question is asking you to..."
+
+Rules:
+- Do not solve the problem.
+- Do not provide hints.
+- Do not give steps.
+- Do not guide the student.
+- Keep it short and clear.
+${getAppLanguageInstruction(outputLanguage, { preserveJson: true })}
+            `.trim(),
+          },
+          createImageUrlPart(drawingBuffer, drawingMimeType),
+        ],
+      },
+    ],
+  });
+
+  const parsed = parseJsonObject(raw, { explanation: "" });
+  return normalizeBoundedText(
+    String(parsed?.explanation || "").trim() ||
+      "This question is asking you to identify what value or result needs to be found.",
+    220,
+  );
+};
+
 const cleanJsonBlock = (value) =>
   String(value || "")
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```\s*$/i, "")
     .trim();
+
+const normalizeMathTextForComparison = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9=+\-*/^().√]/g, "");
+
+const isSingleFocusedStep = (value) => {
+  const source = String(value || "").trim();
+  if (!source) return false;
+  const lineCount = source.split(/\n+/).filter(Boolean).length;
+  const equalsCount = (source.match(/=/g) || []).length;
+  return lineCount <= 1 && equalsCount <= 1;
+};
+
+const expressionsRoughlyMatch = (left, right) => {
+  const normalizedLeft = normalizeMathTextForComparison(left);
+  const normalizedRight = normalizeMathTextForComparison(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.includes(normalizedRight) ||
+    normalizedRight.includes(normalizedLeft)
+  );
+};
 
 const parseJsonObject = (value, fallback) => {
   try {
@@ -1091,6 +1813,61 @@ Rules:
   };
 };
 
+const buildDashboardInsightsFallback = ({ studentName, notebooks }) => {
+  const safeName = String(studentName || "Student").trim() || "Student";
+  const notebookList = Array.isArray(notebooks) ? notebooks : [];
+  const topNotebooks = notebookList.slice(0, 3);
+  const focusNames = topNotebooks.map((item) => String(item?.notebook || "").trim()).filter(Boolean);
+  const recommendationSource = topNotebooks.length > 0 ? topNotebooks : notebookList;
+
+  return {
+    learningPlan: [
+      {
+        label: "Topics to revise",
+        detail: focusNames.length > 0
+          ? `Focus on ${focusNames.join(", ")} today.`
+          : `${safeName}, add notebook content to unlock topic guidance.`,
+        value: focusNames.length > 0 ? `${focusNames.length} topics` : "Set up",
+      },
+      {
+        label: "Practice problems",
+        detail: recommendationSource.length > 0
+          ? "Solve a short set from your active assignment sheets."
+          : "Upload an assignment sheet to start problem practice.",
+        value: recommendationSource.length > 0 ? `${Math.max(3, recommendationSource.length * 2)} problems` : "0 problems",
+      },
+      {
+        label: "AI revision suggested",
+        detail: recommendationSource.length > 0
+          ? "Review weak areas with Saarthi or quiz tools."
+          : "Your revision suggestions will appear after you add notes.",
+        value: recommendationSource.length > 0 ? "15 min" : "Coming soon",
+      },
+    ],
+    recommendations: (recommendationSource.length > 0
+      ? recommendationSource
+      : [{ notebook: "your notebook", progressScore: 0 }]).slice(0, 3).map((item) => {
+      const notebook = String(item?.notebook || "your notebook").trim();
+      const score = Math.max(0, Math.min(100, Number(item?.progressScore || 0)));
+      return {
+        title: `Review ${notebook}`,
+        reason: score >= 70 ? "You are progressing well. Keep the momentum going." : "This area needs a little more revision and practice.",
+        action: "Open notes",
+      };
+    }),
+    mastery: notebookList.map((item) => {
+      const score = Math.max(0, Math.min(100, Number(item?.progressScore || 0)));
+      return {
+        topic: String(item?.notebook || "Untitled notebook").trim() || "Untitled notebook",
+        score,
+        status: score >= 80 ? "strong" : score >= 50 ? "medium" : "weak",
+        focus: score >= 80 ? "Strong progress. Keep revising." : "Needs more revision and guided practice.",
+      };
+    }),
+    summary: "Fallback dashboard insights are shown while Azure AI recommendations are unavailable.",
+  };
+};
+
 const extractImageTextWithAzureOpenAI = async (buffer, mimeType = "image/png") => {
   const raw = await requestAzureChatCompletion({
     temperature: 0.1,
@@ -1244,22 +2021,56 @@ const parsePrincipalHeader = (headerValue) => {
 const readClaim = (claims = [], ...types) =>
   claims.find((claim) => types.includes(claim.typ))?.val || "";
 
+const looksLikeEmail = (value) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || "").trim());
+
+const getEmailLocalPart = (email) => {
+  const localPart = String(email || "").trim().split("@")[0] || "";
+  return localPart.replace(/[._-]+/g, " ").trim();
+};
+
+const resolveDisplayName = ({ claims = [], userDetails = "", email = "" }) => {
+  const givenName = readClaim(
+    claims,
+    "given_name",
+    "givenname",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname",
+  );
+  if (String(givenName || "").trim()) return String(givenName).trim();
+
+  const fullName = readClaim(
+    claims,
+    "name",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
+  );
+  if (String(fullName || "").trim() && !looksLikeEmail(fullName)) {
+    return String(fullName).trim();
+  }
+
+  if (String(userDetails || "").trim() && !looksLikeEmail(userDetails)) {
+    return String(userDetails).trim();
+  }
+
+  const fallbackFromEmail = getEmailLocalPart(email);
+  if (fallbackFromEmail) return fallbackFromEmail;
+  return "User";
+};
+
 const principalToUser = (principal) => {
   if (!principal?.userId) return null;
   const claims = Array.isArray(principal.claims) ? principal.claims : [];
+  const email =
+    readClaim(
+      claims,
+      "email",
+      "emails",
+      "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+    ) || "";
+
   return {
     id: principal.userId,
-    name:
-      readClaim(claims, "name", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name") ||
-      principal.userDetails ||
-      "User",
-    email:
-      readClaim(
-        claims,
-        "email",
-        "emails",
-        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
-      ) || "",
+    name: resolveDisplayName({ claims, userDetails: principal.userDetails, email }),
+    email,
     provider: principal.identityProvider || "",
     avatarUrl:
       readClaim(
@@ -1291,12 +2102,13 @@ const headersToUser = (request) => {
 
   const decodedPrincipal = parsePrincipalHeader(request.headers["x-ms-client-principal"]);
   const userFromPrincipal = principalToUser(decodedPrincipal);
-  const name = request.headers["x-ms-client-principal-name"] || "User";
+  const name = String(request.headers["x-ms-client-principal-name"] || "");
   const provider = request.headers["x-ms-client-principal-idp"] || "";
+  const email = String(userFromPrincipal?.email || name);
   return {
     id: String(userId),
-    name: String(userFromPrincipal?.name || name),
-    email: String(userFromPrincipal?.email || name),
+    name: String(userFromPrincipal?.name || resolveDisplayName({ userDetails: name, email })),
+    email,
     provider: String(provider),
     avatarUrl: String(userFromPrincipal?.avatarUrl || ""),
   };
@@ -1515,6 +2327,143 @@ const normalizeErrorPayload = (body) => {
   };
 };
 
+const inferErrorTypeFromText = (value = "") => {
+  const text = String(value || "").toLowerCase();
+  if (!text) return "concept review";
+  if (/(proof|prove|theorem|justif)/.test(text)) {
+    return "proof reasoning";
+  }
+  if (/(arithmetic|calculate|calculation|compute|addition|subtraction|multiply|division)/.test(text)) {
+    return "arithmetic";
+  }
+  if (/(sign|negative|positive)/.test(text)) {
+    return "sign error";
+  }
+  if (/(substitut|plug|replace)/.test(text)) {
+    return "substitution";
+  }
+  if (/(equation|solve|isolate|inverse)/.test(text)) {
+    return "equation solving";
+  }
+  if (/(fraction|denominator|numerator)/.test(text)) {
+    return "fractions";
+  }
+  return "concept review";
+};
+
+const inferTopicsFromContext = (problemContext = "", stage = "", errorText = "") => {
+  const haystack = `${problemContext} ${stage} ${errorText}`.toLowerCase();
+  const topics = [];
+  const maybeAdd = (topic, pattern) => {
+    if (pattern.test(haystack) && !topics.includes(topic)) {
+      topics.push(topic);
+    }
+  };
+
+  // Try specific topics first so weak-area insights can name precise skills.
+  maybeAdd("quadratic equations", /\bquadratic|x\^2|discriminant|quadratic formula|roots\b/);
+  maybeAdd("linear equations", /\blinear\b/);
+  maybeAdd("proofs", /\bproof|prove|proving\b/);
+  maybeAdd("factoring", /\bfactor|factoring\b/);
+  maybeAdd("polynomials", /\bpolynomial|polynomials\b/);
+  maybeAdd("systems of equations", /\bsystem of equations|simultaneous equations\b/);
+  maybeAdd("inequalities", /\binequalit(y|ies)\b/);
+  maybeAdd("functions", /\bfunction|domain|range\b/);
+  maybeAdd("trigonometric identities", /\bidentity|identities\b.*\b(sin|cos|tan)|\b(sin|cos|tan).*\bidentity\b/);
+  maybeAdd("derivatives", /\bderivative|differentiat(ion|e)\b/);
+  maybeAdd("integrals", /\bintegral|integrat(ion|e)\b/);
+  maybeAdd("limits", /\blimit\b/);
+  maybeAdd("probability", /\bprobability|permutation|combination|combinatorics\b/);
+  maybeAdd("statistics", /\bstatistics|mean|median|variance|distribution\b/);
+  maybeAdd("fractions", /\bfraction|denominator|numerator\b/);
+
+  maybeAdd("algebra", /\b(algebra|equation|expression|solve|simplif)\b/);
+  maybeAdd("geometry", /\b(geometry|angle|triangle|circle|area|perimeter|volume)\b/);
+  maybeAdd("calculus", /\b(calculus|derivative|integral|limit|differentiat|integrat)\b/);
+  maybeAdd("trigonometry", /\b(trigonometry|trig|sin|cos|tan|sec|csc|cot)\b/);
+
+  return topics.slice(0, MAX_TOPICS_PER_MISTAKE);
+};
+
+const inferConceptsFromAnalysis = (observedStep = "", errorText = "", stage = "") => {
+  const haystack = `${observedStep} ${errorText} ${stage}`.toLowerCase();
+  const concepts = [];
+  const maybeAdd = (concept, pattern) => {
+    if (pattern.test(haystack) && !concepts.includes(concept)) {
+      concepts.push(concept);
+    }
+  };
+
+  maybeAdd("inverse operations", /\b(inverse|isolate|equation|solve)\b/);
+  maybeAdd("sign handling", /\b(sign|negative|positive)\b/);
+  maybeAdd("arithmetic", /\b(arithmetic|calculate|calculation|addition|subtraction|multiply|division)\b/);
+  maybeAdd("substitution", /\b(substitut|plug|replace)\b/);
+  maybeAdd("fractions", /\b(fraction|denominator|numerator)\b/);
+  maybeAdd("simplification", /\b(simplif|combine like terms|reduce)\b/);
+
+  return concepts.slice(0, MAX_CONCEPTS_PER_MISTAKE);
+};
+
+const buildAutoErrorPayload = ({
+  analysis,
+  errors = [],
+  hintLevel = null,
+  problemContext = "",
+}) => {
+  const observedStep = normalizeBoundedText(analysis?.observed_step, MAX_OBSERVED_STEP_LENGTH);
+  const stage = normalizeBoundedText(analysis?.stage, MAX_STAGE_LENGTH);
+  const correctness = normalizeBoundedText(analysis?.correctness, 20).toLowerCase();
+  const confidence = normalizeBoundedText(analysis?.confidence, 20).toLowerCase() || "medium";
+  const firstError =
+    Array.isArray(errors) &&
+    errors.find((entry) =>
+      typeof entry === "string"
+        ? entry.trim()
+        : String(entry?.summary || entry?.mistakeSummary || entry?.error || entry?.whyWrong || "").trim(),
+    );
+  const primaryError = normalizeBoundedText(
+    typeof firstError === "string"
+      ? firstError
+      : firstError?.summary || firstError?.mistakeSummary || firstError?.error || firstError?.whyWrong || "",
+    MAX_MISTAKE_SUMMARY_LENGTH,
+  );
+  const primaryReason = normalizeBoundedText(
+    typeof firstError === "string" ? firstError : firstError?.reason || firstError?.whyWrong || primaryError,
+    MAX_WHY_WRONG_LENGTH,
+  );
+
+  if (correctness !== "incorrect" || !primaryError) {
+    return null;
+  }
+
+  return {
+    source: "error_analysis",
+    observedStep,
+    stage,
+    correctness: "incorrect",
+    confidence: ["low", "medium", "high"].includes(confidence) ? confidence : "medium",
+    hintLevel: Number.isInteger(hintLevel) ? hintLevel : null,
+    rawAnalysis:
+      analysis && typeof analysis === "object"
+        ? {
+            ...analysis,
+            extractedErrors: errors.filter(Boolean),
+          }
+        : null,
+    mistakes: [
+      {
+        errorType: inferErrorTypeFromText(`${stage} ${primaryError}`),
+        mistakeSummary: primaryError,
+        whyWrong: primaryReason,
+        suggestedFix: "",
+        severity: "medium",
+        topics: inferTopicsFromContext(problemContext, stage, primaryError),
+        concepts: inferConceptsFromAnalysis(observedStep, primaryError, stage),
+      },
+    ],
+  };
+};
+
 const getAssignmentAndProblemIndex = async (request, response) => {
   const assignment = await findAssignmentById(request.user.id, request.params.id);
   if (!assignment) {
@@ -1659,6 +2608,7 @@ app.post("/api/notes/study-tools", requireAuth, async (request, response) => {
   const subject = String(request.body?.subject || "").trim();
   const notes = Array.isArray(request.body?.notes) ? request.body.notes : [];
   const supportedTools = new Set(["flashcards", "quiz", "revision-sheet", "mind-map"]);
+  const persistentCacheTools = new Set(["revision-sheet", "mind-map"]);
 
   if (!supportedTools.has(tool)) {
     response.status(400).json({ message: "Unsupported study tool." });
@@ -1686,18 +2636,49 @@ app.post("/api/notes/study-tools", requireAuth, async (request, response) => {
     .map((entry, index) => `Note ${index + 1}: ${entry.title || "Untitled"}\n${entry.content}`)
     .join("\n\n---\n\n")
     .slice(0, 50000);
+  const notesSignature = createHash("sha256")
+    .update(JSON.stringify(normalizedNotes))
+    .digest("hex");
+  const canUsePersistentCache = persistentCacheTools.has(tool);
 
   try {
+    if (canUsePersistentCache) {
+      const cached = await getStudyToolCache(request.user.id, {
+        tool,
+        subject,
+        notesSignature,
+      });
+      if (cached?.output) {
+        response.json({
+          tool,
+          subject,
+          output: cached.output,
+          cached: true,
+        });
+        return;
+      }
+    }
+
     const output = await generateStudyToolWithAzure({
       tool,
       subject,
       notesText,
     });
 
+    if (canUsePersistentCache) {
+      await upsertStudyToolCache(request.user.id, {
+        tool,
+        subject,
+        notesSignature,
+        output,
+      });
+    }
+
     response.json({
       tool,
       subject,
       output,
+      cached: false,
     });
   } catch (error) {
     console.error("Study tool generation failed:", error.message);
@@ -1734,11 +2715,20 @@ app.post("/api/notes/insights", requireAuth, async (request, response) => {
       title: title || "Untitled Note",
       content,
     });
+    const safety = await analyzeNoteContentSafety(content);
+    if (mode === "summary" && safety.detected) {
+      output.summary = `${output.summary ? `${output.summary} ` : ""}Inappropriate or irrelevant content was also detected in the note. Do not write such lines in study notes.`.trim();
+      output.revisionChecklist = [
+        "Remove any inappropriate or irrelevant lines from the note.",
+        ...output.revisionChecklist,
+      ].filter(Boolean);
+    }
 
     response.json({
       mode,
       subject,
       output,
+      safety,
     });
   } catch (error) {
     console.error("Note insight generation failed:", error.message);
@@ -1760,6 +2750,22 @@ app.post("/api/notes/extract-image-text", requireAuth, upload.single("file"), as
   }
 
   try {
+    const imageModeration = await moderateImageInput(
+      file.buffer,
+      file.mimetype || "image/png",
+      "notes_extract_image_text",
+    );
+    if (shouldBlockModerationResult(imageModeration)) {
+      response.status(400).json({
+        message: formatModerationMessage("notebook image"),
+        moderation: {
+          action: imageModeration.action,
+          reasonCodes: imageModeration.reasonCodes,
+        },
+      });
+      return;
+    }
+
     const text = await extractImageTextWithAzureOpenAI(file.buffer, file.mimetype || "image/png");
     response.json({ text });
   } catch (error) {
@@ -1839,6 +2845,21 @@ app.post("/api/notebooks/:subjectId/notes", requireAuth, async (request, respons
     return;
   }
   try {
+    const noteModerationText = [title, content].filter(Boolean).join("\n\n").slice(0, 12000);
+    if (noteModerationText) {
+      const textModeration = await moderateTextInput(noteModerationText, "notes_text_create");
+      if (shouldBlockModerationResult(textModeration)) {
+        response.status(400).json({
+          message: buildNoteModerationMessage(),
+          moderation: {
+            action: textModeration.action,
+            reasonCodes: textModeration.reasonCodes,
+          },
+        });
+        return;
+      }
+    }
+
     const subject = await loadNotebookSubjectOrRespond(request, response);
     if (!subject) return;
     const note = await insertNotebookNote(request.user.id, request.params.subjectId, { title, content, tags, sourceType: "text" });
@@ -1877,6 +2898,21 @@ app.patch("/api/notebooks/:subjectId/notes/:noteId", requireAuth, async (request
   const content = request.body?.content != null ? String(request.body.content) : undefined;
   const tags = Array.isArray(request.body?.tags) ? request.body.tags : undefined;
   try {
+    const noteModerationText = [title, content].filter((value) => typeof value === "string" && value.trim()).join("\n\n").slice(0, 12000);
+    if (noteModerationText) {
+      const textModeration = await moderateTextInput(noteModerationText, "notes_text_update");
+      if (shouldBlockModerationResult(textModeration)) {
+        response.status(400).json({
+          message: buildNoteModerationMessage(),
+          moderation: {
+            action: textModeration.action,
+            reasonCodes: textModeration.reasonCodes,
+          },
+        });
+        return;
+      }
+    }
+
     const updated = await updateNotebookNote(request.user.id, request.params.noteId, { title, content, tags });
     if (!updated) { response.status(404).json({ message: "Note not found." }); return; }
     
@@ -1930,14 +2966,6 @@ app.post("/api/notebooks/:subjectId/notes/upload-pdf", requireAuth, upload.singl
   if (!file) { response.status(400).json({ message: "PDF file is required." }); return; }
   if (file.mimetype !== "application/pdf") { response.status(400).json({ message: "Only PDF files are supported." }); return; }
   try {
-    const subject = await loadNotebookSubjectOrRespond(request, response);
-    if (!subject) return;
-    const tempNoteId = `note-${Date.now()}`;
-    const blobResult = await uploadNoteFileToBlob({
-      userId: request.user.id, subjectId: request.params.subjectId,
-      noteId: tempNoteId, fileName: file.originalname || "upload.pdf",
-      contentType: "application/pdf", buffer: file.buffer,
-    });
     let extractedText = String(request.body?.extractedText || "").trim();
     if (!extractedText || extractedText === "No readable text was found in this PDF.") {
       try {
@@ -1946,6 +2974,51 @@ app.post("/api/notebooks/:subjectId/notes/upload-pdf", requireAuth, upload.singl
         console.error("Fallback PDF extraction failed:", err.message);
       }
     }
+
+    if (extractedText) {
+      const textModeration = await moderateTextInput(
+        extractedText.slice(0, 12000),
+        "notes_upload_pdf_text",
+      );
+      if (shouldBlockModerationResult(textModeration)) {
+        response.status(400).json({
+          message: buildNoteModerationMessage(),
+          moderation: {
+            action: textModeration.action,
+            reasonCodes: textModeration.reasonCodes,
+          },
+        });
+        return;
+      }
+    }
+
+    const pdfImages = await extractImagesFromPdfBuffer(file.buffer).catch(() => []);
+    for (const [index, image] of pdfImages.entries()) {
+      const imageModeration = await moderateImageInput(
+        image.buffer,
+        image.mimeType || "image/png",
+        `notes_upload_pdf_image_${index + 1}`,
+      );
+      if (shouldBlockModerationResult(imageModeration)) {
+        response.status(400).json({
+          message: buildNoteModerationMessage(),
+          moderation: {
+            action: imageModeration.action,
+            reasonCodes: imageModeration.reasonCodes,
+          },
+        });
+        return;
+      }
+    }
+
+    const subject = await loadNotebookSubjectOrRespond(request, response);
+    if (!subject) return;
+    const tempNoteId = `note-${Date.now()}`;
+    const blobResult = await uploadNoteFileToBlob({
+      userId: request.user.id, subjectId: request.params.subjectId,
+      noteId: tempNoteId, fileName: file.originalname || "upload.pdf",
+      contentType: "application/pdf", buffer: file.buffer,
+    });
     const title = String(request.body?.title || file.originalname || "PDF Upload")
       .replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ").trim() || "PDF Upload";
     const note = await insertNotebookNote(request.user.id, request.params.subjectId, {
@@ -1994,6 +3067,22 @@ app.post("/api/notebooks/:subjectId/notes/upload-image", requireAuth, upload.sin
   const allowedTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
   if (!allowedTypes.has(file.mimetype)) { response.status(400).json({ message: "Only PNG, JPEG, and WEBP images are supported." }); return; }
   try {
+    const imageModeration = await moderateImageInput(
+      file.buffer,
+      file.mimetype,
+      "notes_upload_image",
+    );
+    if (shouldBlockModerationResult(imageModeration)) {
+      response.status(400).json({
+        message: buildNoteModerationMessage(),
+        moderation: {
+          action: imageModeration.action,
+          reasonCodes: imageModeration.reasonCodes,
+        },
+      });
+      return;
+    }
+
     const subject = await loadNotebookSubjectOrRespond(request, response);
     if (!subject) return;
     const tempNoteId = `note-${Date.now()}`;
@@ -2005,6 +3094,22 @@ app.post("/api/notebooks/:subjectId/notes/upload-image", requireAuth, upload.sin
     let extractedText = "";
     try { extractedText = await extractImageTextWithAzureOpenAI(file.buffer, file.mimetype); } catch (ocrErr) {
       console.error("OCR extraction failed, saving note without text:", ocrErr.message);
+    }
+    if (extractedText) {
+      const textModeration = await moderateTextInput(
+        extractedText.slice(0, 12000),
+        "notes_upload_image_text",
+      );
+      if (shouldBlockModerationResult(textModeration)) {
+        response.status(400).json({
+          message: buildNoteModerationMessage(),
+          moderation: {
+            action: textModeration.action,
+            reasonCodes: textModeration.reasonCodes,
+          },
+        });
+        return;
+      }
     }
     const title = String(request.body?.title || file.originalname || "Image Upload")
       .replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ").trim() || "Image Upload";
@@ -2159,29 +3264,95 @@ app.post("/api/socratic/chat", requireAuth, async (request, response) => {
   const history = Array.isArray(request.body?.history) ? request.body.history : [];
   const subjectId = request.body?.subjectId || null;
   const context = request.body?.context || {}; // { topic, concept, errorType, responseFormat }
+  const requestedTutorId = String(context?.tutorId || request.body?.tutorMode || "").trim().toLowerCase();
+  const tutorId = requestedTutorId === "vaani" ? "vaani" : "saarthi";
   const threadId = String(request.body?.threadId || "").trim();
   const audioBase64 = String(request.body?.audioBase64 || "").trim();
   const images = Array.isArray(request.body?.images) ? request.body.images : [];
   const rawClassLevel = Number(request.body?.classLevel);
   const classLevel =
     Number.isInteger(rawClassLevel) && rawClassLevel >= 1 && rawClassLevel <= 12 ? rawClassLevel : null;
+  const appLanguage = getAppLanguageCode(request.body?.appLanguage);
 
   if (!message && !audioBase64 && images.length === 0) {
     return response.status(400).json({ message: "Message, audio, or image is required." });
   }
 
   try {
-    const searchQuery = message || "student question";
-    const searchResults = await searchNotes(request.user.id, searchQuery, subjectId, 5);
-    
-    // Build text context from search results
-    let noteContext = "";
-    if (searchResults && searchResults.length > 0) {
-      noteContext = "Relevant notes context from student's notebook:\n" + 
-        searchResults.map((res, i) => `[${i + 1}] Title: ${res.title}\nContent snippet: ${res.chunkText}`).join("\n\n");
+    if (message) {
+      if (isLocallyUnsafeOrIrrelevantStudyMessage(message)) {
+        return response.json({
+          reply: buildStudyFocusModerationReply(appLanguage),
+          usedNotes: false,
+          usedNoteImages: false,
+          moderation: {
+            action: "review",
+            reasonCodes: ["local_irrelevant_or_harmful_content"],
+          },
+        });
+      }
+
+      const textModeration = await moderateTextInput(message, "socratic_chat_message");
+      if (shouldBlockModerationResult(textModeration)) {
+        return response.json({
+          reply: buildStudyFocusModerationReply(appLanguage),
+          usedNotes: false,
+          usedNoteImages: false,
+          moderation: {
+            action: textModeration.action,
+            reasonCodes: textModeration.reasonCodes,
+          },
+        });
+      }
     }
 
-    const shouldRetrieveSourceImages = shouldUseRetrievedSourceImages(searchQuery, images);
+    for (const [index, img] of images.entries()) {
+      const imageBuffer = Buffer.from(String(img?.base64 || ""), "base64");
+      if (!imageBuffer.length) continue;
+      const imageModeration = await moderateImageInput(
+        imageBuffer,
+        img?.mimeType || "image/png",
+        `socratic_chat_image_${index + 1}`,
+      );
+      if (shouldBlockModerationResult(imageModeration)) {
+        return response.json({
+          reply: buildStudyFocusModerationReply(appLanguage),
+          usedNotes: false,
+          usedNoteImages: false,
+          moderation: {
+            action: imageModeration.action,
+            reasonCodes: imageModeration.reasonCodes,
+          },
+        });
+      }
+    }
+
+    const searchQuery = message || "student question";
+    const searchStrategy = shouldUseNotesSearchForQuery({
+      query: searchQuery,
+      hasAudio: Boolean(audioBase64),
+      imageCount: images.length,
+    });
+    const isSaarthiRoute = tutorId === "saarthi";
+    const searchResults = isSaarthiRoute
+      ? await searchNotes(request.user.id, searchQuery, subjectId, 5)
+      : searchStrategy.enabled
+        ? await searchNotes(request.user.id, searchQuery, subjectId, 5)
+        : [];
+
+    // Build text context from search results
+    const noteContext = isSaarthiRoute
+      ? searchResults && searchResults.length > 0
+        ? "Relevant notes context from student's notebook:\n" +
+          searchResults
+            .map((res, i) => `[${i + 1}] Title: ${res.title}\nContent snippet: ${res.chunkText}`)
+            .join("\n\n")
+        : ""
+      : buildBoundedNoteContext(searchResults);
+
+    const shouldRetrieveSourceImages = isSaarthiRoute
+      ? shouldUseRetrievedSourceImages(searchQuery, images)
+      : searchStrategy.enabled && shouldUseRetrievedSourceImages(searchQuery, images);
 
     // Fetch source images for multimodal context (image notes + PDF pages)
     const retrievedImages = [];
@@ -2257,7 +3428,50 @@ app.post("/api/socratic/chat", requireAuth, async (request, response) => {
       );
     }
 
-    const systemPrompt = `You are a Socratic tutor aiming to help a student learn without giving away the direct answers.
+    if (isAzureDebugEnabled()) {
+      console.log("Socratic request context", {
+        userId: request.user?.id || "unknown",
+        threadId: threadId || null,
+        messageChars: message.length,
+        historyCount: history.length,
+        classLevel,
+        tutorId,
+        searchQueryChars: searchQuery.length,
+        searchEnabled: isSaarthiRoute ? true : searchStrategy.enabled,
+        searchReason: isSaarthiRoute ? "legacy_socratic_route" : searchStrategy.reason,
+        searchResultCount: searchResults.length,
+        noteContextChars: noteContext.length,
+        shouldRetrieveSourceImages,
+        uploadedImageCount: images.length,
+        retrievedImageCount: retrievedImages.length,
+        hasAudio: Boolean(audioBase64),
+      });
+    }
+
+    const vaaniSystemPrompt = `You are Vaani, a straightforward tutor.
+Give the direct answer first, then explain the reasoning clearly.
+Do not hold back the final answer once you are confident about the academic request.
+Avoid Socratic back-and-forth unless the student explicitly asks for step-by-step guidance.
+Adjust your language, difficulty, and examples for this student's class level: ${classLevel ? `Class ${classLevel}` : "unknown"}.
+If there is relevant notes context provided below, use it to provide personalized hints or references.
+If the student sends audio, transcribe their speech internally and respond to the content of what they said.
+If the student attaches images, analyze them carefully. The images may contain math problems, handwritten work, diagrams, or textbook pages. Describe what you see and respond based on the visual content.
+If source images from the student's notebook are included in this conversation, use them to provide visual references and better explanations. Reference specific diagrams or figures when helpful.
+Current learning context: Topic: ${context.topic || "unknown"}.
+Selected tutor: Vaani.
+Preferred response format: ${context.responseFormat === "voice" ? "voice (short, conversational, easy to speak aloud)." : "steps (clear numbered steps)."}
+Do not give the same generic reply to every question. Base your reply on the student's latest question, visible work, notes context, and tutor role.
+If the student's latest question changes, your response must change accordingly and address that exact question.
+Never translate, transliterate, or paraphrase notebook names or assignment names mentioned in user content, history, or note context.
+Formatting rules:
+- Start with the direct answer or result.
+- Then give 2-4 short supporting steps or reasons.
+- Keep the full response compact and avoid long paragraphs.
+${getAppLanguageInstruction(appLanguage, { preserveEntityNames: true })}
+
+${noteContext}`;
+
+    const saarthiSystemPrompt = `You are a Socratic tutor aiming to help a student learn without giving away the direct answers.
 Ask probing questions, break down problems, and guide them to their own realization in 1-2 short sentences.
 Adjust your language, difficulty, and examples for this student's class level: ${classLevel ? `Class ${classLevel}` : "unknown"}.
 If there is relevant notes context provided below, use it to provide personalized hints or references, but still don't give away the direct answer.
@@ -2272,6 +3486,8 @@ Formatting rules:
 - Keep the full response compact and avoid long paragraphs.
 
 ${noteContext}`;
+
+    const systemPrompt = tutorId === "vaani" ? vaaniSystemPrompt : saarthiSystemPrompt;
 
     // Build user content — multimodal when audio, user images, or retrieved images are present
     let userContent;
@@ -2330,9 +3546,28 @@ ${noteContext}`;
 
     const replyText = await requestAzureChatCompletion({
       messages: promptMessages, 
-      maxTokens: 180, 
-      temperature: 0.5 
+      maxTokens: 420, 
+      temperature: 0.5,
+      debugTag: "socratic_chat",
+      debugMeta: {
+        userId: request.user?.id || "unknown",
+        threadId: threadId || null,
+        historyCount: history.length,
+        tutorId,
+        searchEnabled: isSaarthiRoute ? true : searchStrategy.enabled,
+        searchReason: isSaarthiRoute ? "legacy_socratic_route" : searchStrategy.reason,
+        searchResultCount: searchResults.length,
+        noteContextChars: noteContext.length,
+        uploadedImageCount: images.length,
+        retrievedImageCount: retrievedImages.length,
+        hasAudio: Boolean(audioBase64),
+      },
     });
+
+    const replyModeration = await moderateTextInput(replyText, "socratic_chat_reply");
+    const safeReplyText = shouldBlockModerationResult(replyModeration)
+      ? buildStudyFocusModerationReply(appLanguage)
+      : replyText;
 
     if (dbReady && threadId) {
       const userMessageForHistory = message || (audioBase64 ? "(Voice input)" : images.length > 0 ? "(Image input)" : "");
@@ -2348,7 +3583,8 @@ ${noteContext}`;
       await insertSocraticChatMessage(request.user.id, {
         threadId,
         role: "assistant",
-        text: replyText,
+        text: safeReplyText,
+        tutorId,
         createdAt: now + 1,
       }).catch((persistError) => {
         console.warn("Failed to persist Socratic assistant message:", persistError.message);
@@ -2356,7 +3592,7 @@ ${noteContext}`;
     }
 
     response.json({ 
-      reply: replyText, 
+      reply: safeReplyText, 
       usedNotes: searchResults.length > 0,
       usedNoteImages: retrievedImages.length > 0,
     });
@@ -2376,6 +3612,15 @@ app.post("/api/socratic/threads", requireDb, requireAuth, async (request, respon
   const title = normalizeBoundedText(request.body?.title || "New chat", 120) || "New chat";
   const thread = await createSocraticChatThread(request.user.id, title);
   response.status(201).json(thread);
+});
+
+app.delete("/api/socratic/threads/:threadId", requireDb, requireAuth, async (request, response) => {
+  const deleted = await removeSocraticChatThread(request.user.id, request.params.threadId);
+  if (!deleted) {
+    response.status(404).json({ message: "Chat thread not found." });
+    return;
+  }
+  response.json({ deleted: true, threadId: deleted.id });
 });
 
 app.get("/api/socratic/threads/:threadId/messages", requireDb, requireAuth, async (request, response) => {
@@ -2411,6 +3656,152 @@ app.get("/api/speech/token", requireAuth, async (request, response) => {
   }
 });
 
+app.post("/api/assignments/:id/problem-detections", requireAuth, upload.single("file"), async (request, response) => {
+  const assignment = await findAssignmentById(request.user.id, request.params.id);
+  if (!assignment) {
+    response.status(404).json({ message: "Assignment not found." });
+    return;
+  }
+
+  const file = request.file;
+  if (!file) {
+    response.status(400).json({ message: "Worksheet image is required." });
+    return;
+  }
+
+  const allowedTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
+  if (!allowedTypes.has(file.mimetype)) {
+    response.status(400).json({ message: "Only PNG, JPEG, and WEBP uploads are supported." });
+    return;
+  }
+
+  try {
+    const raw = await detectProblemRegionsWithAzure(file.buffer, file.mimetype || "image/png");
+    const cleaned = String(raw || "").replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    const parsed = safeJsonParse(cleaned) || {};
+    const problems = Array.isArray(parsed?.problems) ? parsed.problems : [];
+
+    const normalizedProblems = problems
+      .map((problem, index) => {
+        const bounds = problem?.bounds || {};
+        const x = clampUnit(bounds.x, 0);
+        const y = clampUnit(bounds.y, 0);
+        const width = clampUnit(bounds.width, 1 - x);
+        const height = clampUnit(bounds.height, 1 - y);
+
+        return {
+          label: normalizeBoundedText(problem?.label || `Problem ${index + 1}`, 120) || `Problem ${index + 1}`,
+          bounds: {
+            x,
+            y,
+            width: Math.max(0.08, Math.min(1 - x, width)),
+            height: Math.max(0.08, Math.min(1 - y, height)),
+          },
+        };
+      })
+      .filter((problem) => problem.bounds.width > 0 && problem.bounds.height > 0)
+      .slice(0, MAX_PROBLEM_COUNT);
+
+    response.json({
+      assignmentId: assignment.id,
+      problems: normalizedProblems.length > 0
+        ? normalizedProblems
+        : [{ label: "Problem 1", bounds: { x: 0, y: 0, width: 1, height: 1 } }],
+    });
+  } catch (error) {
+    console.error("Problem detection failed:", error.message);
+    response.status(500).json({ message: "Unable to detect problems from this worksheet right now." });
+  }
+});
+
+app.post("/api/accessibility/translate", requireAuth, async (request, response) => {
+  const targetLanguage = String(request.body?.targetLanguage || "").trim().toLowerCase();
+  const texts = Array.isArray(request.body?.texts) ? request.body.texts : [];
+
+  if (!targetLanguage) {
+    response.status(400).json({ message: "targetLanguage is required." });
+    return;
+  }
+
+  const normalizedTexts = texts
+    .map((entry) => String(entry || ""))
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, 100);
+
+  if (normalizedTexts.length === 0) {
+    response.json({ targetLanguage, translations: [] });
+    return;
+  }
+
+  try {
+    const { endpoint, documentEndpoint, apiKey, region } = getAzureTranslatorConfig();
+    const candidateEndpoints = Array.from(
+      new Set(
+        [endpoint, documentEndpoint]
+          .map((value) => trimTrailingSlash(value))
+          .filter(Boolean),
+      ),
+    );
+
+    let payload = null;
+    let lastError = null;
+
+    for (const candidateEndpoint of candidateEndpoints) {
+      const translatorUrl = new URL(`${candidateEndpoint}/translator/text/v3.0/translate`);
+      translatorUrl.searchParams.set("api-version", "3.0");
+      translatorUrl.searchParams.set("to", targetLanguage);
+
+      const headers = {
+        "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": apiKey,
+        "X-ClientTraceId": randomBytes(16).toString("hex"),
+      };
+
+      if (region) {
+        headers["Ocp-Apim-Subscription-Region"] = region;
+      }
+
+      const translatorResponse = await fetch(translatorUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(normalizedTexts.map((text) => ({ text }))),
+      });
+
+      if (!translatorResponse.ok) {
+        const detail = await translatorResponse.text().catch(() => "");
+        lastError = new Error(
+          `Azure Translator request failed for ${candidateEndpoint} (${translatorResponse.status}). ${String(detail).slice(0, 300)}`,
+        );
+        continue;
+      }
+
+      payload = await translatorResponse.json();
+      lastError = null;
+      break;
+    }
+
+    if (!payload) {
+      throw lastError || new Error("Azure Translator request failed.");
+    }
+
+    const translations = Array.isArray(payload)
+      ? payload.map((item, index) => {
+          const value = item?.translations?.[0]?.text;
+          return typeof value === "string" && value.trim() ? value : normalizedTexts[index];
+        })
+      : normalizedTexts;
+
+    response.json({
+      targetLanguage,
+      translations,
+    });
+  } catch (error) {
+    console.error("Accessibility translation failed:", error.message);
+    response.status(500).json({ message: "Unable to translate the app right now." });
+  }
+});
+
 app.post("/api/dashboard/insights", requireAuth, async (request, response) => {
   const studentName = String(request.body?.studentName || "").trim();
   const notebooks = Array.isArray(request.body?.notebooks) ? request.body.notebooks : [];
@@ -2428,7 +3819,7 @@ app.post("/api/dashboard/insights", requireAuth, async (request, response) => {
     response.json(insights);
   } catch (error) {
     console.error("Dashboard insight generation failed:", error.message);
-    response.status(500).json({ message: "Unable to generate dashboard insights right now." });
+    response.json(buildDashboardInsightsFallback({ studentName, notebooks }));
   }
 });
 
@@ -2466,6 +3857,7 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
       }
     }
     const mode = String(request.body?.mode || "hint").trim().toLowerCase();
+    const appLanguage = getAppLanguageCode(request.body?.appLanguage);
 
     if (mode === "calculate") {
       const formattedContext = formatProblemContextForHint(problemContext);
@@ -2473,6 +3865,7 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
         drawingBuffer: file.buffer,
         drawingMimeType: file.mimetype || "image/png",
         problemContext: formattedContext,
+        outputLanguage: appLanguage,
       });
 
       return response.json({
@@ -2482,7 +3875,7 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
         readable: calculated.readable,
         message: calculated.readable
           ? ""
-          : "I could not reliably read the selected expression. Select a tighter area or write it more clearly.",
+          : getLocalizedMessage("unreadable_calculation", appLanguage),
       });
     }
 
@@ -2496,7 +3889,7 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
           content: [
             {
               type: "text",
-              text: `Explain what the math expression or step in this image means.\n\nProblem context:\n${formattedContext || "None"}\n\nOne short paragraph. Use LaTeX for equations.`,
+              text: `Explain what the math expression or step in this image means.\n\nProblem context:\n${formattedContext || "None"}\n\nOne short paragraph. Use LaTeX for equations.\n${getAppLanguageInstruction(appLanguage)}`,
             },
             createImageUrlPart(file.buffer, file.mimetype || "image/png"),
           ],
@@ -2504,12 +3897,27 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
       });
       return response.json({ explanation: raw });
     }
+
+    if (mode === "simplify-question") {
+      const formattedContext = formatProblemContextForHint(problemContext);
+      const explanation = await simplifyQuestionWithAzure({
+        drawingBuffer: file.buffer,
+        drawingMimeType: file.mimetype || "image/png",
+        problemContext: formattedContext,
+        outputLanguage: appLanguage,
+      });
+      return response.json({ explanation });
+    }
+
     const formattedContext = formatProblemContextForHint(problemContext);
-    const errorCheck = await generateErrorFeedbackWithAzure({
+    let errorCheck = await generateErrorFeedbackWithAzure({
       problemContext: formattedContext,
       drawingBuffer: file.buffer,
       drawingMimeType: file.mimetype || "image/png",
+      outputLanguage: appLanguage,
     });
+
+    const hintLevel = Math.min(4, Math.max(1, Number(request.body?.hintLevel) || 1));
 
     let analysis = {
       observed_step: "",
@@ -2517,9 +3925,16 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
       confidence: "medium",
     };
     let hint = "";
-    let errors = errorCheck.hasError ? [errorCheck.error] : [];
+    let errors = errorCheck.hasError
+      ? [{
+          observedStep: errorCheck.observedStep || "",
+          summary: errorCheck.error,
+          reason: errorCheck.reason || errorCheck.error,
+        }]
+      : [];
 
-    if (!errorCheck.hasError) {
+    if (errorCheck.hasError) {
+      let interpretedAnalysis = null;
       const analysisRaw = await interpretStudentStepWithAzure({
         drawingBuffer: file.buffer,
         drawingMimeType: file.mimetype || "image/png",
@@ -2527,10 +3942,72 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
       });
 
       try {
-        const cleaned = analysisRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
-        analysis = JSON.parse(cleaned);
+        interpretedAnalysis = JSON.parse(
+          analysisRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim(),
+        );
       } catch {
-        analysis = { observed_step: "Unreadable", correctness: "unclear", confidence: "low" };
+        interpretedAnalysis = null;
+      }
+
+      const interpretedObservedStep = String(interpretedAnalysis?.observed_step || "").trim();
+      if (interpretedObservedStep && interpretedObservedStep.toLowerCase() !== "unreadable") {
+        analysis = {
+          observed_step: interpretedObservedStep,
+          correctness: String(interpretedAnalysis?.correctness || "incorrect").toLowerCase() || "incorrect",
+          confidence: String(interpretedAnalysis?.confidence || "low").toLowerCase() || "low",
+        };
+        errors = errors.map((entry) => ({
+          ...entry,
+          observedStep: interpretedObservedStep,
+        }));
+      }
+
+      const calculated = await calculateSelectionWithAzure({
+        drawingBuffer: file.buffer,
+        drawingMimeType: file.mimetype || "image/png",
+        problemContext: formattedContext,
+        outputLanguage: appLanguage,
+      });
+
+      const calculationLooksReliable =
+        calculated.readable &&
+        Boolean(String(calculated.value || "").trim()) &&
+        ["medium", "high"].includes(String(calculated.confidence || "").toLowerCase());
+      const sameStepAsCalculation =
+        isSingleFocusedStep(interpretedObservedStep) &&
+        expressionsRoughlyMatch(interpretedObservedStep, calculated.expression);
+
+      if (calculationLooksReliable && sameStepAsCalculation) {
+        errorCheck = {
+          hasError: false,
+          error: "",
+          reason: "",
+          observedStep: "",
+        };
+        errors = [];
+        analysis = {
+          observed_step:
+            interpretedObservedStep || String(calculated.expression || "").trim() || "Readable calculation",
+          correctness: "correct",
+          confidence: String(calculated.confidence || "").toLowerCase() || "medium",
+        };
+      }
+    }
+
+    if (!errorCheck.hasError) {
+      if (!String(analysis?.observed_step || "").trim()) {
+        const analysisRaw = await interpretStudentStepWithAzure({
+          drawingBuffer: file.buffer,
+          drawingMimeType: file.mimetype || "image/png",
+          problemContext,
+        });
+
+        try {
+          const cleaned = analysisRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+          analysis = JSON.parse(cleaned);
+        } catch {
+          analysis = { observed_step: "Unreadable", correctness: "unclear", confidence: "low" };
+        }
       }
 
       const observedStep = String(analysis?.observed_step || "");
@@ -2544,24 +4021,48 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
       }
 
       const isUnreadableStep = !observedStep || observedStep.toLowerCase() === "unreadable";
-      const hintLevel = Math.min(4, Math.max(1, Number(request.body?.hintLevel) || 1));
       const previousHints = Array.isArray(safeJsonParse(request.body?.previousHints))
         ? safeJsonParse(request.body.previousHints).slice(0, 5).map(String)
         : [];
 
       hint = isUnreadableStep
-        ? buildUnreadableHint(problemContext)
+        ? buildUnreadableHint(problemContext, appLanguage)
         : await generateHintWithAzure({
             problemContext: formattedContext,
             studentAnalysis: analysis,
             hintLevel,
-            previousHints
+            previousHints,
+            outputLanguage: appLanguage,
           });
 
       if (hint && classifyHintAsError(hint)) {
-        errors = [sanitizeHint(hint)];
+        const sanitizedHint = sanitizeHint(hint);
+        errors = [{ observedStep: String(analysis?.observed_step || "").trim(), summary: sanitizedHint, reason: sanitizedHint }];
         hint = "";
         analysis.correctness = "incorrect";
+      }
+    }
+
+    if (assignmentId && problemIndex != null) {
+      const errorPayload = buildAutoErrorPayload({
+        analysis,
+        errors,
+        hintLevel,
+        problemContext,
+      });
+
+      if (errorPayload) {
+        const normalizedPayload = normalizeErrorPayload(errorPayload);
+        if (normalizedPayload.payload) {
+          void createProblemErrorAttempt(
+            request.user.id,
+            assignmentId,
+            problemIndex,
+            normalizedPayload.payload,
+          ).catch((persistError) => {
+            console.error("AI analyze error persistence failed:", persistError.message);
+          });
+        }
       }
     }
 
@@ -2723,6 +4224,8 @@ app.post("/api/auth/logout", (request, response) => {
 app.delete("/api/account", requireDb, requireAuth, async (request, response) => {
   const uploadedPdfs = await listAssignmentPdfsForUser(request.user.id);
   await Promise.all(uploadedPdfs.map((record) => deleteBlobIfExists(record.blobName)));
+  const uploadedCaptures = await listAssignmentCaptureImagesForUser(request.user.id);
+  await Promise.all(uploadedCaptures.map((record) => deleteBlobIfExists(record.blobName)));
   const problemImageBlobNames = await listProblemImageBlobNamesForUser(request.user.id);
   await Promise.all(problemImageBlobNames.map((blobName) => deleteBlobIfExists(blobName)));
   await deleteUserData(request.user.id);
@@ -2768,6 +4271,11 @@ app.delete("/api/assignments/:id", requireDb, requireAuth, async (request, respo
   if (existingPdf) {
     await deleteBlobIfExists(existingPdf.blobName);
     await removeAssignmentPdf(request.user.id, request.params.id);
+  }
+  const existingCapture = await getAssignmentCaptureImageByAssignmentId(request.user.id, request.params.id);
+  if (existingCapture) {
+    await deleteBlobIfExists(existingCapture.blobName);
+    await removeAssignmentCaptureImage(request.user.id, request.params.id);
   }
 
   const sceneBlobNames = await listSceneBlobNamesForAssignment(request.user.id, request.params.id);
@@ -3002,6 +4510,40 @@ app.post(
       return;
     }
 
+    const extractedText = await extractTextFromPdfBuffer(file.buffer).catch(() => "");
+    if (extractedText) {
+      const textModeration = await moderateTextInput(extractedText.slice(0, 12000), "assignment_pdf_text");
+      if (shouldBlockModerationResult(textModeration)) {
+        response.status(400).json({
+          message: formatModerationMessage("PDF"),
+          moderation: {
+            action: textModeration.action,
+            reasonCodes: textModeration.reasonCodes,
+          },
+        });
+        return;
+      }
+    }
+
+    const pdfImages = await extractImagesFromPdfBuffer(file.buffer).catch(() => []);
+    for (const [index, image] of pdfImages.entries()) {
+      const imageModeration = await moderateImageInput(
+        image.buffer,
+        image.mimeType || "image/png",
+        `assignment_pdf_image_${index + 1}`,
+      );
+      if (shouldBlockModerationResult(imageModeration)) {
+        response.status(400).json({
+          message: formatModerationMessage("PDF"),
+          moderation: {
+            action: imageModeration.action,
+            reasonCodes: imageModeration.reasonCodes,
+          },
+        });
+        return;
+      }
+    }
+
     const existingRecord = await getAssignmentPdfByAssignmentId(request.user.id, request.params.id);
     const blobName = await uploadAssignmentPdfToBlob({
       userId: request.user.id,
@@ -3096,6 +4638,170 @@ app.get("/api/assignments/:id/pdf/download", requireDb, requireAuth, async (requ
   }
 
   response.setHeader("Content-Type", record.contentType || "application/pdf");
+  response.setHeader("Content-Length", String(blob.contentLength || record.size));
+  response.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(record.fileName)}"`);
+  blob.stream.pipe(response);
+});
+
+app.get("/api/assignments/:id/capture", requireDb, requireAuth, async (request, response) => {
+  const assignment = await findAssignmentById(request.user.id, request.params.id);
+  if (!assignment) {
+    response.status(404).json({ message: "Assignment not found." });
+    return;
+  }
+
+  const record = await getAssignmentCaptureImageByAssignmentId(request.user.id, request.params.id);
+  if (!record) {
+    response.json(null);
+    return;
+  }
+
+  response.json({
+    assignmentId: record.assignmentId,
+    fileName: record.fileName,
+    contentType: record.contentType,
+    size: record.size,
+    uploadedAt: record.uploadedAt,
+    updatedAt: record.updatedAt,
+    channel: "image/capture",
+  });
+});
+
+app.post(
+  "/api/assignments/:id/capture",
+  requireDb,
+  requireAuth,
+  imageUpload.single("file"),
+  async (request, response) => {
+    const assignment = await findAssignmentById(request.user.id, request.params.id);
+    if (!assignment) {
+      response.status(404).json({ message: "Assignment not found." });
+      return;
+    }
+
+    const file = request.file;
+    if (!file) {
+      response.status(400).json({ message: "Capture image is required." });
+      return;
+    }
+
+    const allowedTypes = new Set(["image/png", "image/jpeg"]);
+    if (!allowedTypes.has(file.mimetype)) {
+      response.status(400).json({ message: "Only PNG and JPEG uploads are supported." });
+      return;
+    }
+
+    const imageModeration = await moderateImageInput(
+      file.buffer,
+      file.mimetype,
+      "assignment_capture_upload",
+    );
+    if (shouldBlockModerationResult(imageModeration)) {
+      response.status(400).json({
+        message: formatModerationMessage("assignment image"),
+        moderation: {
+          action: imageModeration.action,
+          reasonCodes: imageModeration.reasonCodes,
+        },
+      });
+      return;
+    }
+
+    const existingRecord = await getAssignmentCaptureImageByAssignmentId(request.user.id, request.params.id);
+    const blobName = await uploadAssignmentCaptureToBlob({
+      userId: request.user.id,
+      assignmentId: request.params.id,
+      fileName: file.originalname || "problem-capture",
+      contentType: file.mimetype,
+      buffer: file.buffer,
+    });
+
+    let record = null;
+    try {
+      record = await upsertAssignmentCaptureImage({
+        assignmentId: request.params.id,
+        userId: request.user.id,
+        blobName,
+        fileName: file.originalname || "problem-capture",
+        contentType: file.mimetype,
+        size: file.size,
+      });
+    } catch (error) {
+      await deleteBlobIfExists(blobName);
+      throw error;
+    }
+
+    if (existingRecord && existingRecord.blobName !== blobName) {
+      await deleteBlobIfExists(existingRecord.blobName);
+    }
+
+    response.status(201).json({
+      assignmentId: record.assignmentId,
+      fileName: record.fileName,
+      contentType: record.contentType,
+      size: record.size,
+      uploadedAt: record.uploadedAt,
+      updatedAt: record.updatedAt,
+      channel: "image/capture",
+    });
+  },
+);
+
+app.delete("/api/assignments/:id/capture", requireDb, requireAuth, async (request, response) => {
+  const assignment = await findAssignmentById(request.user.id, request.params.id);
+  if (!assignment) {
+    response.status(404).json({ message: "Assignment not found." });
+    return;
+  }
+
+  const record = await removeAssignmentCaptureImage(request.user.id, request.params.id);
+  if (record) {
+    await deleteBlobIfExists(record.blobName);
+  }
+  response.status(204).send();
+});
+
+app.get("/api/assignments/:id/capture/download-url", requireDb, requireAuth, async (request, response) => {
+  const assignment = await findAssignmentById(request.user.id, request.params.id);
+  if (!assignment) {
+    response.status(404).json({ message: "Assignment not found." });
+    return;
+  }
+
+  const record = await getAssignmentCaptureImageByAssignmentId(request.user.id, request.params.id);
+  if (!record) {
+    response.status(404).json({ message: "No capture image uploaded yet." });
+    return;
+  }
+
+  const url = await createReadSasUrl(record.blobName);
+  if (!url) {
+    response.status(404).json({ message: "Direct download URL is unavailable." });
+    return;
+  }
+  response.json({ url });
+});
+
+app.get("/api/assignments/:id/capture/download", requireDb, requireAuth, async (request, response) => {
+  const assignment = await findAssignmentById(request.user.id, request.params.id);
+  if (!assignment) {
+    response.status(404).json({ message: "Assignment not found." });
+    return;
+  }
+
+  const record = await getAssignmentCaptureImageByAssignmentId(request.user.id, request.params.id);
+  if (!record) {
+    response.status(404).json({ message: "No capture image uploaded yet." });
+    return;
+  }
+
+  const blob = await downloadAssignmentCaptureFromBlob(record.blobName);
+  if (!blob?.stream) {
+    response.status(404).json({ message: "Capture image is missing from storage." });
+    return;
+  }
+
+  response.setHeader("Content-Type", record.contentType || "image/jpeg");
   response.setHeader("Content-Length", String(blob.contentLength || record.size));
   response.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(record.fileName)}"`);
   blob.stream.pipe(response);
@@ -3283,6 +4989,22 @@ app.put(
     const allowedTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
     if (!allowedTypes.has(file.mimetype)) {
       response.status(400).json({ message: "Only PNG, JPEG, and WEBP uploads are supported." });
+      return;
+    }
+
+    const imageModeration = await moderateImageInput(
+      file.buffer,
+      file.mimetype,
+      "assignment_problem_image_upload",
+    );
+    if (shouldBlockModerationResult(imageModeration)) {
+      response.status(400).json({
+        message: formatModerationMessage("problem image"),
+        moderation: {
+          action: imageModeration.action,
+          reasonCodes: imageModeration.reasonCodes,
+        },
+      });
       return;
     }
 
