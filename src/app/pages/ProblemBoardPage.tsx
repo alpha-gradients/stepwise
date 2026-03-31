@@ -111,13 +111,18 @@ const extractInsightEntries = (value: any, forcedKind: string | null = null): an
       value.message ||
       value.value ||
       value.description ||
+      value.whyWrong ||
+      value.reason ||
       "";
+    const summaryValue =
+      value.title || value.label || value.mistakeSummary || value.summary || value.error || "";
 
     if (textValue) {
       return [
         {
           content: String(textValue),
-          title: value.title || value.label || "",
+          title: summaryValue,
+          observedStep: String(value.observedStep || value.observed_step || value.step || "").trim(),
           kind: value.kind || value.type || value.category || forcedKind,
         },
       ];
@@ -160,6 +165,7 @@ const parseInsightsForProblem = (assignment: any, problemIndex: number) => {
       content: String(entry.content || "").trim(),
       kind: classifyInsightKind(entry),
       title: String(entry.title || "").trim(),
+      observedStep: String(entry.observedStep || entry.observed_step || "").trim(),
     }))
     .filter((entry) => entry.content.length > 0);
 
@@ -242,10 +248,28 @@ const deriveInsightsFromAiResult = (result: any, requestedMode: string) => {
 
   const toEntries = (items: any, kind: string) =>
     Array.isArray(items)
-      ? items
-          .map((item) => String(item || "").trim())
-          .filter(Boolean)
-          .map((content) => ({ kind, content }))
+      ? items.flatMap((item) => {
+          if (typeof item === "string") {
+            const content = String(item || "").trim();
+            return content ? [{ kind, content }] : [];
+          }
+
+          if (item && typeof item === "object") {
+            const title = String(
+              item.title || item.label || item.summary || item.mistakeSummary || item.error || "",
+            ).trim();
+            const content = String(
+              item.content || item.text || item.reason || item.whyWrong || item.summary || item.error || "",
+            ).trim();
+            const observedStep = String(
+              item.observedStep || item.observed_step || item.step || result?.analysis?.observed_step || "",
+            ).trim();
+
+            return content ? [{ kind, title, content, observedStep }] : [];
+          }
+
+          return [];
+        })
       : [];
 
   entries.push(...toEntries(result?.hints, "hint"));
@@ -297,6 +321,7 @@ const deriveInsightsFromAiResult = (result: any, requestedMode: string) => {
     kind: entry.kind,
     title: entry.title,
     content: entry.content,
+    observedStep: entry.observedStep,
   }));
 };
 
@@ -579,7 +604,7 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
     hintLevelRef.current = 1;
   }, []);
 
-  const handleToggleInsightAudio = useCallback(async (insight: { id: string; title?: string; content: string }) => {
+  const handleToggleInsightAudio = useCallback(async (insight: { id: string; title?: string; content: string; observedStep?: string }) => {
     if (playingInsightId === insight.id) {
       stopAccessibilitySpeech();
       setPlayingInsightId(null);
@@ -587,7 +612,11 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
     }
 
     const settings = getUserSettings();
-    const rawSpeechText = [String(insight.title || "").trim(), String(insight.content || "").trim()]
+    const rawSpeechText = [
+      String(insight.title || "").trim(),
+      insight.observedStep ? `Observed step: ${String(insight.observedStep).trim()}` : "",
+      String(insight.content || "").trim(),
+    ]
       .filter(Boolean)
       .join(". ");
 
@@ -1518,36 +1547,55 @@ export function ProblemBoardPage({ assignmentId, problemIndex, onBack }: Problem
             <h2>Recommendations</h2>
 
             {wrongInsights.length > 0 && (
-              <div className="insight-group">
-                <h3>Errors</h3>
-                {wrongInsights.map((insight) => (
-                  <details key={insight.id} className="insight-item insight-item-wrong" open>
-                    <summary>
-                      <span className="insight-summary-title">{insight.title || "Error Found"}</span>
-                      <span className="insight-summary-controls">
-                        <button
-                          type="button"
-                          className={`btn-secondary btn-sm insight-audio-button ${
-                            playingInsightId === insight.id ? "is-playing" : ""
-                          }`}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            void handleToggleInsightAudio(insight);
-                          }}
-                          aria-label={playingInsightId === insight.id ? "Stop error audio" : "Play error audio"}
-                          title={playingInsightId === insight.id ? "Stop audio" : "Play audio"}
-                        >
-                          {playingInsightId === insight.id ? <Square size={13} /> : <Play size={14} />}
-                          {playingInsightId === insight.id ? "Stop" : "Play"}
-                        </button>
-                        <span className="insight-summary-toggle" aria-hidden="true" />
-                      </span>
-                    </summary>
-                    <LatexText text={insight.content} as="p" />
-                  </details>
-                ))}
-              </div>
+              <details className="insight-group insight-group-errors">
+                <summary className="insight-group-summary">
+                  <span>Errors</span>
+                  <span className="insight-group-summary-meta">
+                    <span className="insight-group-count">{wrongInsights.length}</span>
+                    <span className="insight-summary-toggle" aria-hidden="true" />
+                  </span>
+                </summary>
+                <div className="insight-group-body">
+                  {wrongInsights.map((insight) => (
+                    <details key={insight.id} className="insight-item insight-item-wrong">
+                      <summary>
+                        <span className="insight-summary-title">{insight.title || "Error Found"}</span>
+                        <span className="insight-summary-controls">
+                          <button
+                            type="button"
+                            className={`btn-secondary btn-sm insight-audio-button ${
+                              playingInsightId === insight.id ? "is-playing" : ""
+                            }`}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              void handleToggleInsightAudio(insight);
+                            }}
+                            aria-label={playingInsightId === insight.id ? "Stop error audio" : "Play error audio"}
+                            title={playingInsightId === insight.id ? "Stop audio" : "Play audio"}
+                          >
+                            {playingInsightId === insight.id ? <Square size={13} /> : <Play size={14} />}
+                            {playingInsightId === insight.id ? "Stop" : "Play"}
+                          </button>
+                          <span className="insight-summary-toggle" aria-hidden="true" />
+                        </span>
+                      </summary>
+                      <div className="insight-item-body">
+                        {insight.observedStep && (
+                          <div className="insight-detail-block">
+                            <span className="insight-detail-label">Observed step</span>
+                            <LatexText text={insight.observedStep} as="p" />
+                          </div>
+                        )}
+                        <div className="insight-detail-block">
+                          <span className="insight-detail-label">Why AI flagged it</span>
+                          <LatexText text={insight.content} as="p" />
+                        </div>
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              </details>
             )}
 
             {hintInsights.length > 0 && (

@@ -1217,12 +1217,17 @@ ${problemContext || "None"}
 
 Return exactly one of these two formats only:
 1. No
-2. Yes: <short error description>
+2. Yes
+Step: <the specific step or expression you believe is wrong>
+Summary: <short error description>
+Reason: <one short explanation of why this step is wrong>
 
 Rules:
 - Only answer "Yes" if there is a clear mathematical error in the written step.
 - Do not provide hints, corrections, next steps, or the final answer.
-- Keep the error description short and specific.
+- The step should quote the expression or transformation you think is incorrect.
+- Keep the summary short and specific.
+- The reason must explain what makes the shown step incorrect.
 - Do not return JSON.
 ${getAppLanguageInstruction(outputLanguage)}
             `.trim(),
@@ -1235,20 +1240,44 @@ ${getAppLanguageInstruction(outputLanguage)}
 
   const cleaned = String(raw || "").trim();
   if (/^no\b/i.test(cleaned)) {
-    return { hasError: false, error: "" };
+    return { hasError: false, error: "", reason: "", observedStep: "" };
+  }
+
+  const structuredMatch = cleaned.match(
+    /^yes\b[\s\S]*?step\s*:\s*(.+?)\s*(?:\n+|\r\n+)summary\s*:\s*(.+?)\s*(?:\n+|\r\n+)reason\s*:\s*([\s\S]+)$/i,
+  );
+  if (structuredMatch?.[1]) {
+    return {
+      hasError: true,
+      observedStep:
+        normalizeBoundedText(structuredMatch[1], MAX_OBSERVED_STEP_LENGTH) ||
+        "Unreadable",
+      error:
+        normalizeBoundedText(structuredMatch[2], MAX_MISTAKE_SUMMARY_LENGTH) ||
+        "There is an error in this step.",
+      reason:
+        normalizeBoundedText(structuredMatch[3], MAX_WHY_WRONG_LENGTH) ||
+        normalizeBoundedText(structuredMatch[2], MAX_WHY_WRONG_LENGTH) ||
+        "This step does not match the correct math.",
+    };
   }
 
   const yesMatch = cleaned.match(/^yes\s*:\s*(.+)$/i);
   if (yesMatch?.[1]) {
+    const fallback = normalizeBoundedText(yesMatch[1], MAX_WHY_WRONG_LENGTH);
     return {
       hasError: true,
-      error: normalizeBoundedText(yesMatch[1], MAX_WHY_WRONG_LENGTH) || "There is an error in this step.",
+      observedStep: "",
+      error: normalizeBoundedText(yesMatch[1], MAX_MISTAKE_SUMMARY_LENGTH) || "There is an error in this step.",
+      reason: fallback || "This step does not match the correct math.",
     };
   }
 
   return {
     hasError: false,
     error: "",
+    reason: "",
+    observedStep: "",
   };
 };
 
@@ -1365,6 +1394,31 @@ const cleanJsonBlock = (value) =>
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```\s*$/i, "")
     .trim();
+
+const normalizeMathTextForComparison = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9=+\-*/^().√]/g, "");
+
+const isSingleFocusedStep = (value) => {
+  const source = String(value || "").trim();
+  if (!source) return false;
+  const lineCount = source.split(/\n+/).filter(Boolean).length;
+  const equalsCount = (source.match(/=/g) || []).length;
+  return lineCount <= 1 && equalsCount <= 1;
+};
+
+const expressionsRoughlyMatch = (left, right) => {
+  const normalizedLeft = normalizeMathTextForComparison(left);
+  const normalizedRight = normalizeMathTextForComparison(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.includes(normalizedRight) ||
+    normalizedRight.includes(normalizedLeft)
+  );
+};
 
 const parseJsonObject = (value, fallback) => {
   try {
@@ -2360,7 +2414,23 @@ const buildAutoErrorPayload = ({
   const stage = normalizeBoundedText(analysis?.stage, MAX_STAGE_LENGTH);
   const correctness = normalizeBoundedText(analysis?.correctness, 20).toLowerCase();
   const confidence = normalizeBoundedText(analysis?.confidence, 20).toLowerCase() || "medium";
-  const primaryError = normalizeBoundedText(errors.find(Boolean) || "", MAX_MISTAKE_SUMMARY_LENGTH);
+  const firstError =
+    Array.isArray(errors) &&
+    errors.find((entry) =>
+      typeof entry === "string"
+        ? entry.trim()
+        : String(entry?.summary || entry?.mistakeSummary || entry?.error || entry?.whyWrong || "").trim(),
+    );
+  const primaryError = normalizeBoundedText(
+    typeof firstError === "string"
+      ? firstError
+      : firstError?.summary || firstError?.mistakeSummary || firstError?.error || firstError?.whyWrong || "",
+    MAX_MISTAKE_SUMMARY_LENGTH,
+  );
+  const primaryReason = normalizeBoundedText(
+    typeof firstError === "string" ? firstError : firstError?.reason || firstError?.whyWrong || primaryError,
+    MAX_WHY_WRONG_LENGTH,
+  );
 
   if (correctness !== "incorrect" || !primaryError) {
     return null;
@@ -2384,7 +2454,7 @@ const buildAutoErrorPayload = ({
       {
         errorType: inferErrorTypeFromText(`${stage} ${primaryError}`),
         mistakeSummary: primaryError,
-        whyWrong: normalizeBoundedText(primaryError, MAX_WHY_WRONG_LENGTH),
+        whyWrong: primaryReason,
         suggestedFix: "",
         severity: "medium",
         topics: inferTopicsFromContext(problemContext, stage, primaryError),
@@ -3840,7 +3910,7 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
     }
 
     const formattedContext = formatProblemContextForHint(problemContext);
-    const errorCheck = await generateErrorFeedbackWithAzure({
+    let errorCheck = await generateErrorFeedbackWithAzure({
       problemContext: formattedContext,
       drawingBuffer: file.buffer,
       drawingMimeType: file.mimetype || "image/png",
@@ -3855,9 +3925,16 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
       confidence: "medium",
     };
     let hint = "";
-    let errors = errorCheck.hasError ? [errorCheck.error] : [];
+    let errors = errorCheck.hasError
+      ? [{
+          observedStep: errorCheck.observedStep || "",
+          summary: errorCheck.error,
+          reason: errorCheck.reason || errorCheck.error,
+        }]
+      : [];
 
-    if (!errorCheck.hasError) {
+    if (errorCheck.hasError) {
+      let interpretedAnalysis = null;
       const analysisRaw = await interpretStudentStepWithAzure({
         drawingBuffer: file.buffer,
         drawingMimeType: file.mimetype || "image/png",
@@ -3865,10 +3942,72 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
       });
 
       try {
-        const cleaned = analysisRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
-        analysis = JSON.parse(cleaned);
+        interpretedAnalysis = JSON.parse(
+          analysisRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim(),
+        );
       } catch {
-        analysis = { observed_step: "Unreadable", correctness: "unclear", confidence: "low" };
+        interpretedAnalysis = null;
+      }
+
+      const interpretedObservedStep = String(interpretedAnalysis?.observed_step || "").trim();
+      if (interpretedObservedStep && interpretedObservedStep.toLowerCase() !== "unreadable") {
+        analysis = {
+          observed_step: interpretedObservedStep,
+          correctness: String(interpretedAnalysis?.correctness || "incorrect").toLowerCase() || "incorrect",
+          confidence: String(interpretedAnalysis?.confidence || "low").toLowerCase() || "low",
+        };
+        errors = errors.map((entry) => ({
+          ...entry,
+          observedStep: interpretedObservedStep,
+        }));
+      }
+
+      const calculated = await calculateSelectionWithAzure({
+        drawingBuffer: file.buffer,
+        drawingMimeType: file.mimetype || "image/png",
+        problemContext: formattedContext,
+        outputLanguage: appLanguage,
+      });
+
+      const calculationLooksReliable =
+        calculated.readable &&
+        Boolean(String(calculated.value || "").trim()) &&
+        ["medium", "high"].includes(String(calculated.confidence || "").toLowerCase());
+      const sameStepAsCalculation =
+        isSingleFocusedStep(interpretedObservedStep) &&
+        expressionsRoughlyMatch(interpretedObservedStep, calculated.expression);
+
+      if (calculationLooksReliable && sameStepAsCalculation) {
+        errorCheck = {
+          hasError: false,
+          error: "",
+          reason: "",
+          observedStep: "",
+        };
+        errors = [];
+        analysis = {
+          observed_step:
+            interpretedObservedStep || String(calculated.expression || "").trim() || "Readable calculation",
+          correctness: "correct",
+          confidence: String(calculated.confidence || "").toLowerCase() || "medium",
+        };
+      }
+    }
+
+    if (!errorCheck.hasError) {
+      if (!String(analysis?.observed_step || "").trim()) {
+        const analysisRaw = await interpretStudentStepWithAzure({
+          drawingBuffer: file.buffer,
+          drawingMimeType: file.mimetype || "image/png",
+          problemContext,
+        });
+
+        try {
+          const cleaned = analysisRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+          analysis = JSON.parse(cleaned);
+        } catch {
+          analysis = { observed_step: "Unreadable", correctness: "unclear", confidence: "low" };
+        }
       }
 
       const observedStep = String(analysis?.observed_step || "");
@@ -3897,7 +4036,8 @@ app.post("/api/ai/analyze", requireAuth, upload.single("file"), async (request, 
           });
 
       if (hint && classifyHintAsError(hint)) {
-        errors = [sanitizeHint(hint)];
+        const sanitizedHint = sanitizeHint(hint);
+        errors = [{ observedStep: String(analysis?.observed_step || "").trim(), summary: sanitizedHint, reason: sanitizedHint }];
         hint = "";
         analysis.correctness = "incorrect";
       }

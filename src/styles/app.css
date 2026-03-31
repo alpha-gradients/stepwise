@@ -1467,6 +1467,58 @@ textarea {
   margin-bottom: 20px;
 }
 
+.insight-group-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.96);
+  color: var(--ink);
+  font-size: calc(14px * var(--app-text-zoom));
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.insight-group-summary::-webkit-details-marker {
+  display: none;
+}
+
+.insight-group-summary-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.insight-group-count {
+  min-width: 24px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.08);
+  font-size: calc(12px * var(--app-text-zoom));
+  font-weight: 700;
+  text-align: center;
+}
+
+.insight-group-body {
+  margin-top: 10px;
+  padding-left: 10px;
+  border-left: 2px solid rgba(148, 163, 184, 0.32);
+}
+
+.insight-group-errors > .insight-group-summary .insight-summary-toggle::before {
+  content: "+";
+}
+
+.insight-group-errors[open] > .insight-group-summary .insight-summary-toggle::before {
+  content: "−";
+}
+
 .insight-group h3 {
   margin: 0 0 12px;
   font-size: calc(14px * var(--app-text-zoom));
@@ -1532,6 +1584,29 @@ textarea {
   font-size: calc(14px * var(--app-text-zoom));
   line-height: 1.6;
   border-top: 1px solid var(--line);
+}
+
+.insight-item-body {
+  border-top: 1px solid var(--line);
+}
+
+.insight-detail-block + .insight-detail-block {
+  border-top: 1px solid rgba(148, 163, 184, 0.22);
+}
+
+.insight-detail-label {
+  display: block;
+  padding: 12px 16px 0;
+  font-size: calc(11px * var(--app-text-zoom));
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.insight-item-body .insight-detail-block p {
+  border-top: 0;
+  padding-top: 8px;
 }
 
 .insight-summary-toggle {
@@ -2137,6 +2212,20 @@ textarea {
 
 .insight-item-wrong p {
   background: #fef2f2;
+}
+
+.insight-item-wrong .insight-detail-label {
+  color: #b91c1c;
+}
+
+.insight-group-errors > .insight-group-summary {
+  border-color: #fecaca;
+  background: #fff1f2;
+}
+
+.insight-group-errors > .insight-group-summary .insight-group-count {
+  background: rgba(239, 68, 68, 0.12);
+  color: #b91c1c;
 }
 
 .insight-item-calculate {
@@ -6053,6 +6142,7 @@ html[data-color-theme="dark"] .topbar h1,
 html[data-color-theme="dark"] .panel h2,
 html[data-color-theme="dark"] .panel h3,
 html[data-color-theme="dark"] .insights-panel h2,
+html[data-color-theme="dark"] .insight-group-summary,
 html[data-color-theme="dark"] .insight-group h3,
 html[data-color-theme="dark"] .eyebrow,
 html[data-color-theme="dark"] .subtle,
@@ -6083,6 +6173,11 @@ html[data-color-theme="dark"] .insight-item-explain p {
 html[data-color-theme="dark"] .insight-item-hint summary,
 html[data-color-theme="dark"] .insight-item-wrong summary {
   color: #ffffff !important;
+}
+
+html[data-color-theme="dark"] .insight-group-errors > .insight-group-summary {
+  background: #fee2e2 !important;
+  border-color: #fca5a5 !important;
 }
 
 html[data-color-theme="dark"] .insight-item-calculate summary {
