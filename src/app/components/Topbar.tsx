@@ -11,7 +11,6 @@ interface TopbarProps {
   isAudioPlaying: boolean;
   audioButtonLabel?: string;
   streakCount: number;
-  notificationCount: number;
 }
 
 export function Topbar({
@@ -24,11 +23,12 @@ export function Topbar({
   isAudioPlaying,
   audioButtonLabel = 'Play Audio',
   streakCount,
-  notificationCount,
 }: TopbarProps) {
   const [showAccountMenu, setShowAccountMenu] = useState(false);
+  const [showNotificationMenu, setShowNotificationMenu] = useState(false);
   const [avatarFailed, setAvatarFailed] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const notificationRef = useRef<HTMLDivElement>(null);
   const avatarSrc = String(
     user?.avatarUrl || user?.avatarURL || user?.photoURL || user?.picture || "",
   ).trim();
@@ -37,6 +37,9 @@ export function Topbar({
     function handleClickOutside(event: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
         setShowAccountMenu(false);
+      }
+      if (notificationRef.current && !notificationRef.current.contains(event.target as Node)) {
+        setShowNotificationMenu(false);
       }
     }
 
@@ -88,15 +91,29 @@ export function Topbar({
           <span>{streakCount}</span>
         </div>
 
-        <button className="icon-button notification-button" title="AI Recommendations">
-          <img
-            src="/notification-bell-svgrepo-com.svg"
-            alt=""
-            aria-hidden="true"
-            className="notification-icon"
-          />
-          {notificationCount > 0 ? <span className="notification-badge">{notificationCount}</span> : null}
-        </button>
+        <div style={{ position: 'relative' }} ref={notificationRef}>
+          <button
+            type="button"
+            className="icon-button notification-button"
+            title="Notifications"
+            aria-label="Notifications"
+            aria-expanded={showNotificationMenu}
+            onClick={() => setShowNotificationMenu((current) => !current)}
+          >
+            <img
+              src="/notification-bell-svgrepo-com.svg"
+              alt=""
+              aria-hidden="true"
+              className="notification-icon"
+            />
+          </button>
+
+          {showNotificationMenu && (
+            <div className="notification-menu">
+              <div className="notification-empty-state">No notifications</div>
+            </div>
+          )}
+        </div>
         <div style={{ position: 'relative' }} ref={menuRef}>
           <button
             className={`account-button ${avatarSrc && !avatarFailed ? 'account-button-with-photo' : ''}`}
