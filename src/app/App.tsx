@@ -129,7 +129,6 @@ function App() {
   const { route, setRoute, activeRouteKey: stableActiveRouteKey } = useStableRouteState({ type: 'dashboard' });
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(false);
   const [streakCount, setStreakCount] = useState(0);
-  const [notificationCount, setNotificationCount] = useState(0);
   const [userSettings, setUserSettings] = useState<UserSettings>(DEFAULT_USER_SETTINGS);
   const [isAccessibilityAudioPlaying, setIsAccessibilityAudioPlaying] = useState(false);
   const [suppressedNarrationRouteKey, setSuppressedNarrationRouteKey] = useState<string | null>(null);
@@ -378,8 +377,7 @@ function App() {
   }, []);
 
   const handleDashboardMetaChange = useCallback(
-    ({ recommendationCount, streak }: { recommendationCount: number; streak: number }) => {
-      setNotificationCount(recommendationCount);
+    ({ streak }: { recommendationCount: number; streak: number }) => {
       setStreakCount(streak);
     },
     [],
@@ -453,7 +451,6 @@ function App() {
           isAudioPlaying={isAccessibilityAudioPlaying}
           audioButtonLabel={canResumeAudio ? 'Resume Audio' : 'Play Audio'}
           streakCount={streakCount}
-          notificationCount={notificationCount}
         />
 
         {visitedRouteKeys.map((routeKey) => {

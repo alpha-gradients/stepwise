@@ -450,6 +450,26 @@ html[data-color-theme="dark"] .notification-icon {
   justify-content: center;
 }
 
+.notification-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 220px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-lg);
+  z-index: 1000;
+}
+
+.notification-empty-state {
+  padding: 12px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: calc(14px * var(--app-text-zoom));
+}
+
 .icon-button {
   width: 36px;
   height: 36px;
