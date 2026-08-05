@@ -1,0 +1,29 @@
+psql "host=stepwise-database2.postgres.database.azure.com \
+      port=5432 \
+      dbname=postgres \
+      user=alpha_gradients \
+      password=ai_study_buddy_6677 \
+      sslmode=require"
+
+await fetch("/api/dev-auth/impersonate", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  credentials: "include",
+  body: JSON.stringify({ email: "mail.lp@gmail.com" })
+});
+location.reload();
+
+
+
+
+              email               |      last_seen_ist      
+----------------------------------+-------------------------
+ yashwantko5020@gmail.com         | 2026-04-02 07:21:24.081
+ alphagradients@gmail.com         | 2026-03-31 11:15:06.026
+ raghavkotikala9@gmail.com        | 2026-03-30 20:44:02.2
+ mail.lp@gmail.com                | 2026-03-30 14:21:49.525
+ parassikarwar204@gmail.com       | 2026-03-29 20:46:04.348
+ ppbharm2005@gmail.com            | 2026-03-29 17:40:56.483
+ 5012272.oindrilamondal@gmail.com | 2026-03-28 16:52:41.158
+ bornoshreemondal@gmail.com       | 2026-03-26 19:34:14.617
+(8 rows)
