@@ -55,13 +55,19 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_F0130F004C7C4E0FBA00B8715FEA21F9 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_402C7BBA7EB34BD4ABB18ACFA5D442CC }}
   
-      - name: Create deployment package
-        run: |
-          zip -r release.zip .
-  
-      - name: Deploy to Azure Web App using ZipDeploy
+      - name: 'Deploy to Azure Web App'
+        id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'stepwise-'
+          app-name: 'stepwise'
           slot-name: 'Production'
-          package: release.zip
+          package: .
+
+
+
+
+
+
+
+
+ 
